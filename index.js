@@ -18,11 +18,7 @@ const PORT = process.env.PORT || 3001
 
 // ── MIDDLEWARE ───────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: [
-    'https://app.boisesummitcards.com',
-    'https://gradeedge-app.vercel.app',
-    'http://localhost:3000'
-  ],
+  origin: true, // Allow all origins - restrict later for production
   credentials: true
 }))
 app.use(express.json({ limit: '10mb' }))
@@ -155,9 +151,10 @@ app.get('/api/comps', async (req, res) => {
 // ── ROUTE: AI Card Scanner ────────────────────────────────────────────────────
 // POST /api/scan — multipart form with image file OR base64 in JSON
 app.post('/api/scan', upload.single('image'), async (req, res) => {
+  console.log('Scan request received')
   try {
     let imageBase64, mediaType
-
+    console.log('Has file:', !!req.file, 'Has body image:', !!(req.body && req.body.image))
     if (req.file) {
       // Uploaded file via multipart
       imageBase64 = req.file.buffer.toString('base64')
@@ -179,7 +176,7 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
 
     // Send to Claude Vision
     const message = await anthropic.messages.create({
-      model: 'claude-opus-4-6',
+      model: 'claude-sonnet-4-6',
       max_tokens: 500,
       messages: [{
         role: 'user',
