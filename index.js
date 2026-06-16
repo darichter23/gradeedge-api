@@ -83,8 +83,6 @@ app.get('/api/comps', async (req, res) => {
     if (cardNum) parts.push(`#${cardNum}`)
     const query = parts.join(' ')
 
-    const token = await getEbayToken()
-
     // Use eBay Marketplace Insights API for SOLD listings
     // This is the correct modern eBay API for sold/completed item data
     const token = await getEbayToken()
