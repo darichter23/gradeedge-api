@@ -14,7 +14,7 @@ const multer = require('multer')
 const Anthropic = require('@anthropic-ai/sdk')
 
 const app = express()
-const PORT = process.env.PORT || 3001
+const PORT = process.env.PORT || 3001  // Railway sets PORT automatically
 
 // ── MIDDLEWARE ───────────────────────────────────────────────────────────────
 app.use(cors({
@@ -187,28 +187,32 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
           },
           {
             type: 'text',
-            text: `You are a sports card expert. Analyze this trading card image and extract all visible information.
+            text: `You are a world-class sports card expert. Analyze this card image carefully and extract ALL visible text and details.
 
-Return ONLY a JSON object with these exact fields (use null for anything not visible):
+Look for: player name, year, brand/manufacturer (Topps, Panini, Bowman, etc.), set name, parallel/variation (Chrome, Prizm, Refractor, Gold, etc.), card number, sport, team, rookie indicator, autograph, serial number, and if graded: the grade and cert number from the label.
+
+Return ONLY valid JSON:
 {
-  "player": "full player name",
-  "year": 1234,
-  "brand": "card brand/manufacturer",
-  "parallel": "parallel or variation name if any",
-  "cardNum": "card number as string",
+  "player": "exact full name",
+  "year": 2024,
+  "brand": "manufacturer",
+  "setName": "set name e.g. Topps Chrome",
+  "parallel": "parallel name or null",
+  "cardNum": "card number",
   "sport": "Baseball|Basketball|Football|Hockey|Soccer|Pokemon TCG|Other",
   "team": "team name",
-  "rookie": true or false,
-  "autograph": true or false,
-  "serialNumber": "x/y if serialized",
-  "grader": "PSA|BGS|SGC|CGC or null if raw",
-  "grade": number or null,
-  "certNum": "cert number if graded",
-  "estimatedValue": "rough estimate if you know the card",
-  "confidence": "high|medium|low"
+  "rookie": false,
+  "autograph": false,
+  "serialNumber": "x/y or null",
+  "grader": "PSA|BGS|SGC|CGC or null",
+  "grade": null,
+  "certNum": null,
+  "searchQuery": "best eBay search query e.g. 2024 Topps Chrome Shohei Ohtani PSA 10",
+  "confidence": "high|medium|low",
+  "confidenceReason": "brief reason"
 }
 
-Return ONLY valid JSON. No explanation, no markdown.`
+Return ONLY valid JSON. No markdown, no explanation.`
           }
         ]
       }]
@@ -348,5 +352,7 @@ app.get('/api/signal', async (req, res) => {
 // ── START SERVER ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`GradeEdge API running on port ${PORT}`)
+  console.log(`API URL: https://gradeedge-api-production.up.railway.app`)
+  console.log(`Health check: GET /`)
   console.log(`Features: eBay comps, Claude card scanner, market signals`)
 })
