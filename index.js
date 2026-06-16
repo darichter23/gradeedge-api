@@ -85,30 +85,66 @@ app.get('/api/comps', async (req, res) => {
 
     const token = await getEbayToken()
 
-    // Use eBay Finding API for SOLD/COMPLETED listings only
-    // This is the correct API for sold comps - Browse API only shows active listings
-    const findingUrl = new URL('https://svcs.ebay.com/services/search/FindingService/v1')
-    findingUrl.searchParams.set('OPERATION-NAME', 'findCompletedItems')
-    findingUrl.searchParams.set('SERVICE-VERSION', '1.0.0')
-    findingUrl.searchParams.set('SECURITY-APPNAME', process.env.EBAY_CLIENT_ID)
-    findingUrl.searchParams.set('RESPONSE-DATA-FORMAT', 'JSON')
-    findingUrl.searchParams.set('REST-PAYLOAD', '')
-    findingUrl.searchParams.set('keywords', query)
-    findingUrl.searchParams.set('itemFilter(0).name', 'SoldItemsOnly')
-    findingUrl.searchParams.set('itemFilter(0).value', 'true')
-    findingUrl.searchParams.set('itemFilter(1).name', 'Currency')
-    findingUrl.searchParams.set('itemFilter(1).value', 'USD')
-    findingUrl.searchParams.set('sortOrder', 'EndTimeSoonest')
-    findingUrl.searchParams.set('paginationInput.entriesPerPage', '50')
-    findingUrl.searchParams.set('outputSelector', 'SellerInfo')
+    // Use eBay Marketplace Insights API for SOLD listings
+    // This is the correct modern eBay API for sold/completed item data
+    const token = await getEbayToken()
+    
+    const insightsUrl = new URL('https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search')
+    insightsUrl.searchParams.set('q', query)
+    insightsUrl.searchParams.set('limit', '50')
+    insightsUrl.searchParams.set('fieldgroups', 'ADDITIONAL_SELLER_DETAILS')
 
-    const findingRes = await fetch(findingUrl.toString(), {
-      headers: { 'Content-Type': 'application/json' }
+    const insightsRes = await fetch(insightsUrl.toString(), {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        'Content-Type': 'application/json'
+      }
     })
 
-    const findingData = await findingRes.json()
-    const searchResult = findingData?.findCompletedItemsResponse?.[0]
-    const rawItems = searchResult?.searchResult?.[0]?.item || []
+    console.log('Insights API status:', insightsRes.status)
+    const insightsData = await insightsRes.json()
+    console.log('Insights API response keys:', Object.keys(insightsData))
+    
+    let rawItems = []
+    
+    if (insightsRes.ok && insightsData.itemSales && insightsData.itemSales.length > 0) {
+      // Parse marketplace insights sold items
+      rawItems = insightsData.itemSales.map(item => ({
+        title: item.title,
+        price: parseFloat(item.lastSoldPrice?.value || 0),
+        soldDate: item.lastSoldDate || null,
+        daysAgo: item.lastSoldDate ? Math.round((Date.now() - new Date(item.lastSoldDate).getTime()) / (1000*60*60*24)) : null,
+        url: item.itemWebUrl || '',
+        image: item.image?.imageUrl || null,
+        condition: item.condition || 'Unknown',
+        listingType: 'Sold'
+      })).filter(c => c.price > 0)
+    } else {
+      // Fallback: Use Finding API (legacy but still works)
+      console.log('Insights API failed, trying Finding API fallback')
+      const findingUrl = `https://svcs.ebay.com/services/search/FindingService/v1?OPERATION-NAME=findCompletedItems&SERVICE-VERSION=1.0.0&SECURITY-APPNAME=${encodeURIComponent(process.env.EBAY_CLIENT_ID)}&RESPONSE-DATA-FORMAT=JSON&keywords=${encodeURIComponent(query)}&itemFilter%280%29.name=SoldItemsOnly&itemFilter%280%29.value=true&itemFilter%281%29.name=Currency&itemFilter%281%29.value=USD&sortOrder=EndTimeSoonest&paginationInput.entriesPerPage=50`
+      
+      const findingRes = await fetch(findingUrl)
+      const findingData = await findingRes.json()
+      const findingItems = findingData?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+      
+      rawItems = findingItems.map(item => {
+        const price = parseFloat(item.sellingStatus?.[0]?.currentPrice?.[0]?.['__value__'] || 0)
+        const endTime = item.listingInfo?.[0]?.endTime?.[0]
+        const soldDate = endTime ? new Date(endTime) : null
+        return {
+          title: item.title?.[0] || '',
+          price,
+          soldDate: soldDate?.toISOString() || null,
+          daysAgo: soldDate ? Math.round((Date.now() - soldDate.getTime()) / (1000*60*60*24)) : null,
+          url: item.viewItemURL?.[0] || '',
+          image: item.galleryURL?.[0] || null,
+          condition: item.condition?.[0]?.conditionDisplayName?.[0] || 'Unknown',
+          listingType: item.listingInfo?.[0]?.listingType?.[0] || 'Unknown'
+        }
+      }).filter(c => c.price > 0)
+    }
 
     if (rawItems.length === 0) {
       // Fallback to Browse API if Finding API returns nothing
@@ -336,20 +372,9 @@ app.post('/api/comps/bulk', async (req, res) => {
         const query = parts.join(' ')
 
         const token = await getEbayToken()
-        // Use Finding API for sold listings
-        const findUrl = new URL('https://svcs.ebay.com/services/search/FindingService/v1')
-        findUrl.searchParams.set('OPERATION-NAME', 'findCompletedItems')
-        findUrl.searchParams.set('SERVICE-VERSION', '1.0.0')
-        findUrl.searchParams.set('SECURITY-APPNAME', process.env.EBAY_CLIENT_ID)
-        findUrl.searchParams.set('RESPONSE-DATA-FORMAT', 'JSON')
-        findUrl.searchParams.set('keywords', query)
-        findUrl.searchParams.set('itemFilter(0).name', 'SoldItemsOnly')
-        findUrl.searchParams.set('itemFilter(0).value', 'true')
-        findUrl.searchParams.set('itemFilter(1).name', 'Currency')
-        findUrl.searchParams.set('itemFilter(1).value', 'USD')
-        findUrl.searchParams.set('paginationInput.entriesPerPage', '20')
-
-        const searchRes = await fetch(findUrl.toString())
+        // Use Finding API for sold listings (bulk)
+        const findingUrl = `https://svcs.ebay.com/services/search/FindingService/v1?OPERATION-NAME=findCompletedItems&SERVICE-VERSION=1.0.0&SECURITY-APPNAME=${encodeURIComponent(process.env.EBAY_CLIENT_ID)}&RESPONSE-DATA-FORMAT=JSON&keywords=${encodeURIComponent(query)}&itemFilter%280%29.name=SoldItemsOnly&itemFilter%280%29.value=true&sortOrder=EndTimeSoonest&paginationInput.entriesPerPage=20`
+        const searchRes = await fetch(findingUrl)
         const data = await searchRes.json()
         const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
         const prices = items.map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.['__value__'] || 0)).filter(p => p > 0)
