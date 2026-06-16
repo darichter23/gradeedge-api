@@ -85,60 +85,129 @@ app.get('/api/comps', async (req, res) => {
 
     const token = await getEbayToken()
 
-    // Search eBay completed/sold listings
-    const searchUrl = new URL('https://api.ebay.com/buy/browse/v1/item_summary/search')
-    searchUrl.searchParams.set('q', query)
-    searchUrl.searchParams.set('filter', 'buyingOptions:{AUCTION|FIXED_PRICE},conditions:{USED|LIKE_NEW},priceCurrency:USD')
-    searchUrl.searchParams.set('sort', 'endingSoonest')
-    searchUrl.searchParams.set('limit', '20')
-    searchUrl.searchParams.set('fieldgroups', 'EXTENDED')
+    // Use eBay Finding API for SOLD/COMPLETED listings only
+    // This is the correct API for sold comps - Browse API only shows active listings
+    const findingUrl = new URL('https://svcs.ebay.com/services/search/FindingService/v1')
+    findingUrl.searchParams.set('OPERATION-NAME', 'findCompletedItems')
+    findingUrl.searchParams.set('SERVICE-VERSION', '1.0.0')
+    findingUrl.searchParams.set('SECURITY-APPNAME', process.env.EBAY_CLIENT_ID)
+    findingUrl.searchParams.set('RESPONSE-DATA-FORMAT', 'JSON')
+    findingUrl.searchParams.set('REST-PAYLOAD', '')
+    findingUrl.searchParams.set('keywords', query)
+    findingUrl.searchParams.set('itemFilter(0).name', 'SoldItemsOnly')
+    findingUrl.searchParams.set('itemFilter(0).value', 'true')
+    findingUrl.searchParams.set('itemFilter(1).name', 'Currency')
+    findingUrl.searchParams.set('itemFilter(1).value', 'USD')
+    findingUrl.searchParams.set('sortOrder', 'EndTimeSoonest')
+    findingUrl.searchParams.set('paginationInput.entriesPerPage', '50')
+    findingUrl.searchParams.set('outputSelector', 'SellerInfo')
 
-    const searchRes = await fetch(searchUrl.toString(), {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
-      }
+    const findingRes = await fetch(findingUrl.toString(), {
+      headers: { 'Content-Type': 'application/json' }
     })
 
-    const searchData = await searchRes.json()
-    const items = searchData.itemSummaries || []
+    const findingData = await findingRes.json()
+    const searchResult = findingData?.findCompletedItemsResponse?.[0]
+    const rawItems = searchResult?.searchResult?.[0]?.item || []
 
-    // Process results
-    const comps = items
-      .filter(item => item.price)
-      .map(item => ({
-        title: item.title,
-        price: parseFloat(item.price.value),
-        currency: item.price.currency,
-        condition: item.condition,
-        soldDate: item.itemEndDate || item.itemCreationDate,
-        url: item.itemWebUrl,
-        image: item.thumbnailImages?.[0]?.imageUrl || item.image?.imageUrl,
-        seller: item.seller?.username,
-        bids: item.bidCount || 0
-      }))
-      .sort((a, b) => b.price - a.price)
+    if (rawItems.length === 0) {
+      // Fallback to Browse API if Finding API returns nothing
+      console.log('Finding API returned 0 results, trying Browse API fallback')
+      const searchUrl = new URL('https://api.ebay.com/buy/browse/v1/item_summary/search')
+      searchUrl.searchParams.set('q', query)
+      searchUrl.searchParams.set('filter', 'conditions:{USED|LIKE_NEW},priceCurrency:USD')
+      searchUrl.searchParams.set('limit', '20')
+      const browseRes = await fetch(searchUrl.toString(), {
+        headers: { 'Authorization': `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' }
+      })
+      const browseData = await browseRes.json()
+      const browseItems = browseData.itemSummaries || []
+      const browsePrices = browseItems.map(i => parseFloat(i.price?.value)).filter(p => p > 0)
+      const browseAvg = browsePrices.length > 0 ? browsePrices.reduce((a,b)=>a+b,0)/browsePrices.length : 0
+      const browseSorted = [...browsePrices].sort((a,b)=>a-b)
+      const browseMedian = browseSorted.length > 0 ? browseSorted[Math.floor(browseSorted.length/2)] : 0
+      return res.json({
+        query, count: browseItems.length,
+        stats: { avg: Math.round(browseAvg*100)/100, median: Math.round(browseMedian*100)/100, high: Math.max(...browsePrices)||0, low: Math.min(...browsePrices)||0, recommended: Math.round(browseMedian*100)/100 },
+        comps: browseItems.slice(0,10).map(i=>({ title:i.title, price:parseFloat(i.price?.value), url:i.itemWebUrl, image:i.thumbnailImages?.[0]?.imageUrl, note:'Active listing — sold data unavailable for this query' })),
+        source: 'eBay Browse API (active listings - no sold data found)',
+        warning: 'Could not find sold listings for this query. Prices shown are active listings.',
+        fetchedAt: new Date().toISOString()
+      })
+    }
 
-    // Calculate comp statistics
-    const prices = comps.map(c => c.price).filter(p => p > 0)
-    const avgPrice = prices.length > 0 ? prices.reduce((a, b) => a + b, 0) / prices.length : 0
-    const medianPrice = prices.length > 0 ? prices.sort((a,b)=>a-b)[Math.floor(prices.length/2)] : 0
-    const highPrice = prices.length > 0 ? Math.max(...prices) : 0
-    const lowPrice = prices.length > 0 ? Math.min(...prices) : 0
+    // Parse Finding API sold items
+    const now = Date.now()
+    const thirtyDaysAgo = now - (30 * 24 * 60 * 60 * 1000)
+
+    const comps = rawItems.map(item => {
+      const price = parseFloat(item.sellingStatus?.[0]?.currentPrice?.[0]?.['__value__'] || 0)
+      const endTime = item.listingInfo?.[0]?.endTime?.[0]
+      const soldDate = endTime ? new Date(endTime) : null
+      return {
+        title: item.title?.[0] || '',
+        price,
+        soldDate: soldDate?.toISOString() || null,
+        daysAgo: soldDate ? Math.round((now - soldDate.getTime()) / (1000*60*60*24)) : null,
+        url: item.viewItemURL?.[0] || '',
+        image: item.galleryURL?.[0] || null,
+        condition: item.condition?.[0]?.conditionDisplayName?.[0] || 'Unknown',
+        bids: parseInt(item.sellingStatus?.[0]?.bidCount?.[0] || 0),
+        listingType: item.listingInfo?.[0]?.listingType?.[0] || 'Unknown'
+      }
+    }).filter(c => c.price > 0).sort((a, b) => new Date(b.soldDate) - new Date(a.soldDate))
+
+    // Split into recent (0-30 days) and older (30-60 days)
+    const recent = comps.filter(c => c.daysAgo !== null && c.daysAgo <= 30)
+    const older = comps.filter(c => c.daysAgo !== null && c.daysAgo > 30 && c.daysAgo <= 60)
+    const allSold = comps
+
+    // Calculate stats - use median to avoid outlier skew
+    function calcStats(items) {
+      const prices = items.map(i => i.price).filter(p => p > 0).sort((a,b) => a-b)
+      if (prices.length === 0) return null
+      const avg = prices.reduce((a,b)=>a+b,0) / prices.length
+      const median = prices[Math.floor(prices.length/2)]
+      // Trim outliers: remove top and bottom 10% for trimmed mean
+      const trim = Math.floor(prices.length * 0.1)
+      const trimmed = prices.slice(trim, prices.length - trim)
+      const trimmedAvg = trimmed.length > 0 ? trimmed.reduce((a,b)=>a+b,0)/trimmed.length : avg
+      return {
+        count: prices.length,
+        avg: Math.round(avg * 100) / 100,
+        median: Math.round(median * 100) / 100,
+        trimmedAvg: Math.round(trimmedAvg * 100) / 100,
+        high: prices[prices.length - 1],
+        low: prices[0],
+        recommended: Math.round(trimmedAvg * 100) / 100
+      }
+    }
+
+    const recentStats = calcStats(recent)
+    const olderStats = calcStats(older)
+    const allStats = calcStats(allSold)
+
+    // Best recommended price: prioritize recent sales trimmed average
+    const recommended = recentStats?.recommended || allStats?.recommended || 0
+    // 30-day trend
+    const trend = recentStats && olderStats 
+      ? ((recentStats.recommended - olderStats.recommended) / olderStats.recommended * 100).toFixed(1)
+      : null
 
     res.json({
       query,
-      count: comps.length,
+      count: allSold.length,
+      recentCount: recent.length,
       stats: {
-        avg: Math.round(avgPrice * 100) / 100,
-        median: Math.round(medianPrice * 100) / 100,
-        high: highPrice,
-        low: lowPrice,
-        recommended: Math.round(medianPrice * 100) / 100
+        ...allStats,
+        recommended,
+        trend: trend ? parseFloat(trend) : null,
+        trendLabel: trend ? (parseFloat(trend) > 0 ? `↑ ${trend}% vs 30d ago` : `↓ ${Math.abs(trend)}% vs 30d ago`) : null
       },
-      comps: comps.slice(0, 10),
-      source: 'eBay Browse API',
+      recentStats,
+      olderStats,
+      comps: allSold.slice(0, 15),
+      source: 'eBay Finding API — Sold/Completed Listings Only',
       fetchedAt: new Date().toISOString()
     })
 
@@ -267,17 +336,23 @@ app.post('/api/comps/bulk', async (req, res) => {
         const query = parts.join(' ')
 
         const token = await getEbayToken()
-        const searchUrl = new URL('https://api.ebay.com/buy/browse/v1/item_summary/search')
-        searchUrl.searchParams.set('q', query)
-        searchUrl.searchParams.set('filter', 'buyingOptions:{AUCTION|FIXED_PRICE},conditions:{USED|LIKE_NEW}')
-        searchUrl.searchParams.set('limit', '5')
+        // Use Finding API for sold listings
+        const findUrl = new URL('https://svcs.ebay.com/services/search/FindingService/v1')
+        findUrl.searchParams.set('OPERATION-NAME', 'findCompletedItems')
+        findUrl.searchParams.set('SERVICE-VERSION', '1.0.0')
+        findUrl.searchParams.set('SECURITY-APPNAME', process.env.EBAY_CLIENT_ID)
+        findUrl.searchParams.set('RESPONSE-DATA-FORMAT', 'JSON')
+        findUrl.searchParams.set('keywords', query)
+        findUrl.searchParams.set('itemFilter(0).name', 'SoldItemsOnly')
+        findUrl.searchParams.set('itemFilter(0).value', 'true')
+        findUrl.searchParams.set('itemFilter(1).name', 'Currency')
+        findUrl.searchParams.set('itemFilter(1).value', 'USD')
+        findUrl.searchParams.set('paginationInput.entriesPerPage', '20')
 
-        const searchRes = await fetch(searchUrl.toString(), {
-          headers: { 'Authorization': `Bearer ${token}`, 'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' }
-        })
+        const searchRes = await fetch(findUrl.toString())
         const data = await searchRes.json()
-        const items = data.itemSummaries || []
-        const prices = items.map(i => parseFloat(i.price?.value)).filter(p => p > 0)
+        const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
+        const prices = items.map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.['__value__'] || 0)).filter(p => p > 0)
         const avg = prices.length > 0 ? prices.reduce((a,b)=>a+b,0)/prices.length : null
 
         results.push({
