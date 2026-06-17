@@ -2,7 +2,6 @@ require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
 const fetch = require('node-fetch')
-const rateLimit = require('express-rate-limit')
 const multer = require('multer')
 const Anthropic = require('@anthropic-ai/sdk')
 
@@ -11,33 +10,9 @@ const PORT = process.env.PORT || 3001
 
 app.use(cors({ origin: true, credentials: true }))
 app.use(express.json({ limit: '10mb' }))
-app.set('trust proxy', 1)
-
-const limiter = rateLimit({ windowMs: 60 * 1000, max: 60, message: 'Too many requests' })
-const scanLimiter = rateLimit({ windowMs: 60 * 1000, max: 10, message: 'Scan limit reached' })
-app.use('/api/', limiter)
-app.use('/api/scan', scanLimiter)
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-
-let ebayToken = null
-let ebayTokenExpiry = 0
-
-async function getEbayToken() {
-  if (ebayToken && Date.now() < ebayTokenExpiry) return ebayToken
-  const credentials = Buffer.from(`${process.env.EBAY_CLIENT_ID}:${process.env.EBAY_CLIENT_SECRET}`).toString('base64')
-  const response = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
-    method: 'POST',
-    headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope'
-  })
-  const data = await response.json()
-  if (!data.access_token) throw new Error('eBay auth failed: ' + JSON.stringify(data))
-  ebayToken = data.access_token
-  ebayTokenExpiry = Date.now() + (data.expires_in - 60) * 1000
-  return ebayToken
-}
 
 async function fetchSoldComps(query, limit) {
   limit = limit || 100
@@ -55,53 +30,44 @@ async function fetchSoldComps(query, limit) {
     + '&sortOrder=EndTimeSoonest'
     + '&paginationInput.entriesPerPage=' + limit
 
-  console.log('eBay URL:', url.substring(0, 150))
+  console.log('Calling eBay:', url.substring(0, 120))
   const res = await fetch(url)
   const text = await res.text()
-  console.log('eBay raw response start:', text.substring(0, 100))
-
-  if (text.startsWith('<')) {
-    throw new Error('eBay returned HTML error page - check App ID')
-  }
-
+  console.log('eBay response preview:', text.substring(0, 80))
+  if (text.startsWith('<')) throw new Error('eBay returned HTML - check App ID in Railway variables')
   const data = JSON.parse(text)
-  const ack = data?.findCompletedItemsResponse?.[0]?.ack?.[0]
   const items = data?.findCompletedItemsResponse?.[0]?.searchResult?.[0]?.item || []
-  console.log('eBay ack:', ack, 'items:', items.length)
+  console.log('Sold items found:', items.length)
   return items
 }
 
-function calcStats(items) {
-  const prices = items.map(i => parseFloat(i.sellingStatus?.[0]?.currentPrice?.[0]?.['__value__'] || 0))
-    .filter(p => p > 1)
-    .sort((a, b) => a - b)
-  if (prices.length === 0) return null
-  let working = prices
-  if (prices.length >= 5) {
-    const trim = Math.max(1, Math.floor(prices.length * 0.1))
-    working = prices.slice(trim, prices.length - trim)
+function calcStats(prices) {
+  const sorted = prices.filter(p => p > 1).sort((a, b) => a - b)
+  if (sorted.length === 0) return null
+  let w = sorted
+  if (sorted.length >= 5) {
+    const t = Math.max(1, Math.floor(sorted.length * 0.1))
+    w = sorted.slice(t, sorted.length - t)
   }
-  const avg = working.reduce((a, b) => a + b, 0) / working.length
-  const median = working[Math.floor(working.length / 2)]
+  const avg = w.reduce((a, b) => a + b, 0) / w.length
   return {
-    count: prices.length,
+    count: sorted.length,
     avg: Math.round(avg * 100) / 100,
-    median: Math.round(median * 100) / 100,
-    high: prices[prices.length - 1],
-    low: prices[0],
+    median: Math.round(w[Math.floor(w.length / 2)] * 100) / 100,
+    high: sorted[sorted.length - 1],
+    low: sorted[0],
     recommended: Math.round(avg * 100) / 100
   }
 }
 
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '3.0.0', features: ['ebay-sold-comps', 'card-scanner'] })
+  res.json({ status: 'GradeEdge API running', version: '4.0.0' })
 })
 
 app.get('/api/comps', async (req, res) => {
   try {
     const { player, brand, year, grade, cardNum } = req.query
     if (!player) return res.status(400).json({ error: 'player is required' })
-
     const parts = [player]
     if (year) parts.push(year)
     if (brand) parts.push(brand)
@@ -116,8 +82,7 @@ app.get('/api/comps', async (req, res) => {
       return res.json({
         query, count: 0,
         stats: { avg: 0, median: 0, high: 0, low: 0, recommended: 0, trendLabel: 'No sold data found' },
-        comps: [],
-        message: 'No sold listings found. Try fewer search terms.',
+        comps: [], message: 'No sold listings found. Try fewer search terms.',
         source: 'eBay Finding API - Sold Only'
       })
     }
@@ -128,38 +93,14 @@ app.get('/api/comps', async (req, res) => {
       const endTimeStr = item.listingInfo?.[0]?.endTime?.[0]
       const endTime = endTimeStr ? new Date(endTimeStr) : null
       const daysAgo = endTime ? Math.round((now - endTime.getTime()) / (1000 * 60 * 60 * 24)) : 999
-      return {
-        title: item.title?.[0] || '',
-        price,
-        soldDate: endTime?.toISOString() || null,
-        daysAgo,
-        url: item.viewItemURL?.[0] || '',
-        image: item.galleryURL?.[0] || null,
-        condition: item.condition?.[0]?.conditionDisplayName?.[0] || 'Unknown'
-      }
+      return { title: item.title?.[0] || '', price, soldDate: endTime?.toISOString() || null, daysAgo, url: item.viewItemURL?.[0] || '', image: item.galleryURL?.[0] || null, condition: item.condition?.[0]?.conditionDisplayName?.[0] || 'Unknown' }
     }).filter(c => c.price > 1).sort((a, b) => a.daysAgo - b.daysAgo)
 
     const recent = comps.filter(c => c.daysAgo <= 30)
     const older = comps.filter(c => c.daysAgo > 30 && c.daysAgo <= 60)
-
-    const recentStats = calcStats(recent.map(c => ({ sellingStatus: [{ currentPrice: [{ '__value__': c.price }] }] })).map((_, i) => ({ sellingStatus: [{ currentPrice: [{ '__value__': recent[i].price }] }], listingInfo: [{ endTime: [recent[i].soldDate] }] })))
-    const olderStats = calcStats(older.map((_, i) => ({ sellingStatus: [{ currentPrice: [{ '__value__': older[i].price }] }] })))
-
-    const recentPrices = recent.map(c => c.price).filter(p => p > 1).sort((a, b) => a - b)
-    const olderPrices = older.map(c => c.price).filter(p => p > 1).sort((a, b) => a - b)
-    const allPrices = comps.map(c => c.price).filter(p => p > 1).sort((a, b) => a - b)
-
-    function stats(prices) {
-      if (!prices.length) return null
-      let w = prices
-      if (prices.length >= 5) { const t = Math.max(1, Math.floor(prices.length * 0.1)); w = prices.slice(t, prices.length - t) }
-      const avg = w.reduce((a, b) => a + b, 0) / w.length
-      return { count: prices.length, avg: Math.round(avg * 100) / 100, median: Math.round(w[Math.floor(w.length / 2)] * 100) / 100, high: prices[prices.length - 1], low: prices[0], recommended: Math.round(avg * 100) / 100 }
-    }
-
-    const rStats = stats(recentPrices)
-    const oStats = stats(olderPrices)
-    const aStats = stats(allPrices)
+    const rStats = calcStats(recent.map(c => c.price))
+    const oStats = calcStats(older.map(c => c.price))
+    const aStats = calcStats(comps.map(c => c.price))
 
     let trend = null, trendLabel = 'Not enough data for trend'
     if (rStats && oStats && oStats.avg > 0) {
@@ -198,7 +139,7 @@ app.post('/api/scan', upload.single('image'), async (req, res) => {
       model: 'claude-sonnet-4-6', max_tokens: 500,
       messages: [{ role: 'user', content: [
         { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-        { type: 'text', text: 'You are a sports card expert. Analyze this card and return ONLY valid JSON: {"player":"name","year":2024,"brand":"manufacturer","setName":"set","parallel":"parallel or null","cardNum":"number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"reason"}. No markdown.' }
+        { type: 'text', text: 'You are a sports card expert. Analyze this card image and return ONLY valid JSON with no markdown: {"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}' }
       ]}]
     })
     const responseText = message.content[0].text.trim()
@@ -231,6 +172,7 @@ app.post('/api/comps/bulk', async (req, res) => {
 })
 
 app.listen(PORT, () => {
-  console.log('GradeEdge API running on port ' + PORT)
-  console.log('eBay App ID:', process.env.EBAY_CLIENT_ID ? process.env.EBAY_CLIENT_ID.substring(0, 20) + '...' : 'NOT SET')
+  console.log('GradeEdge API v4.0.0 running on port ' + PORT)
+  console.log('eBay App ID configured:', !!process.env.EBAY_CLIENT_ID)
+  console.log('Anthropic configured:', !!process.env.ANTHROPIC_API_KEY)
 })
