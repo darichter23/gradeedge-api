@@ -61,14 +61,15 @@ async function fetchSoldComps(query, limit) {
   limit = limit || 100
   const token = await getEbayToken()
 
-  // Browse API: search completed/sold items
-  // Using the MARKETPLACE_INSIGHTS fieldgroup returns sold price data
+  // Browse API: search active + recently ended listings
+  // Condition IDs: 1000=New, 2000=Refurb, 2500=Very Good, 3000=Good, 4000=Acceptable, 5000=For parts
+  // Sports cards are typically listed as Used (3000) or New (1000 - sealed)
+  // Omitting conditions filter so we get all results (graded cards often listed as "New")
   const params = new URLSearchParams({
     q: query,
     limit: Math.min(limit, 200).toString(),
-    sort: 'endingSoonest',
-    filter: 'buyingOptions:{FIXED_PRICE|AUCTION},conditions:{USED|LIKE_NEW|VERY_GOOD|GOOD|ACCEPTABLE|FOR_PARTS_OR_NOT_WORKING}',
-    fieldgroups: 'MATCHING_ITEMS,ASPECT_REFINEMENTS'
+    sort: 'newlyListed',
+    fieldgroups: 'MATCHING_ITEMS'
   })
 
   const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`
@@ -155,14 +156,14 @@ app.get('/api/comps', async (req, res) => {
 
     const now = Date.now()
     const comps = rawItems.map(item => {
-      // Browse API price field
-      const priceVal = item.price?.value || item.currentBidPrice?.value || '0'
+      // Browse API: lastSoldPrice if available, else listed price
+      const priceVal = item.lastSoldPrice?.value || item.price?.value || item.currentBidPrice?.value || '0'
       const price = parseFloat(priceVal)
 
-      // Browse API uses itemEndDate or lastSoldDate
-      const endTimeStr = item.itemEndDate || item.lastSoldDate || null
+      // Prefer lastSoldDate, then itemEndDate, then itemCreationDate as fallback
+      const endTimeStr = item.lastSoldDate || item.itemEndDate || item.itemCreationDate || null
       const endTime = endTimeStr ? new Date(endTimeStr) : null
-      const daysAgo = endTime ? Math.round((now - endTime.getTime()) / (1000 * 60 * 60 * 24)) : 999
+      const daysAgo = endTime ? Math.round((now - endTime.getTime()) / (1000 * 60 * 60 * 24)) : 0
 
       return {
         title: item.title || '',
