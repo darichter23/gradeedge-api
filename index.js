@@ -4,7 +4,7 @@ const cors = require('cors')
 const fetch = require('node-fetch')
 const multer = require('multer')
 const Anthropic = require('@anthropic-ai/sdk')
-
+const cron = require('node-cron');
 const app = express()
 const PORT = process.env.PORT || 3001
 
@@ -169,15 +169,25 @@ app.get('/', (req, res) => {
   res.json({ status: 'GradeEdge API running', version: '6.0.0' })
 })
 
-// Single-grade comp (used by edit modal LiveCompFetcher)
+// Single-grade comp (used by edit modal / LiveCompFetcher)
 app.get('/api/comps', async (req, res) => {
   try {
-    const { player, brand, year, grade, cardNum } = req.query
+    const { player, brand, year, grade, cardNum, numbered } = req.query
     if (!player) return res.status(400).json({ error: 'player is required' })
 
-    const query = grade
-      ? buildGradedQuery(player, year, brand, cardNum, String(grade).replace(/^PSA\s*/i, ''))
-      : buildRawQuery(player, year, brand, cardNum)
+    const parts = []
+    if (year)     parts.push(String(year).trim())
+    if (brand)    parts.push(brand.trim())
+    if (player)   parts.push(player.trim())
+    if (cardNum)  parts.push(`#${String(cardNum).trim()}`)
+    if (numbered) {
+      const match = String(numbered).match(/\/(\d+)/)
+      if (match) parts.push(`/${match[1]}`)
+      else parts.push(numbered)
+    }
+    const gradeSuffix = grade && !/^raw$/i.test(grade) ? grade : ''
+    if (gradeSuffix) parts.push(gradeSuffix)
+    const query = parts.join(' ')
 
     console.log('Fetching comps for:', query)
     const rawItems = await fetchItems(query, 100)
@@ -193,16 +203,14 @@ app.get('/api/comps', async (req, res) => {
 
     const comps = parseItems(rawItems)
     const recent = comps.filter(c => c.daysAgo <= 30)
-    const older = comps.filter(c => c.daysAgo > 30 && c.daysAgo <= 60)
+    const older  = comps.filter(c => c.daysAgo > 30 && c.daysAgo <= 60)
+    const aStats = calcStats(comps.map(c => c.price))
     const rStats = calcStats(recent.map(c => c.price))
     const oStats = calcStats(older.map(c => c.price))
-    const aStats = calcStats(comps.map(c => c.price))
-
-    let trend = null, trendLabel = 'Not enough data for trend'
-    if (rStats && oStats && oStats.avg > 0) {
-      trend = Math.round(((rStats.avg - oStats.avg) / oStats.avg * 100) * 10) / 10
-      trendLabel = trend > 0 ? `Up ${Math.abs(trend)}% vs 30-60 days ago` : `Down ${Math.abs(trend)}% vs 30-60 days ago`
-    }
+    const trend = rStats?.avg && oStats?.avg
+      ? rStats.avg > oStats.avg ? '📈 Rising' : rStats.avg < oStats.avg ? '📉 Falling' : '➡️ Stable'
+      : '➡️ Stable'
+    const trendLabel = trend
 
     res.json({
       query, count: comps.length, recentCount: recent.length, olderCount: older.length,
@@ -223,57 +231,146 @@ app.get('/api/comps', async (req, res) => {
   }
 })
 
-// ── THREE-TIER COMP: Raw + PSA 9 + PSA 10 in one call ─────────────────────
-app.get('/api/comps/tiers', async (req, res) => {
+// THREE-TIER COMP: Raw + PSA 9 + PSA 10 in one call
+app.post('/api/comps/tiers', async (req, res) => {
+  const { card } = req.body
+  if (!card) return res.status(400).json({ error: 'Card data is required' })
+  if (!card.player_name && !card.brand_parallel) {
+    return res.status(400).json({ error: 'Card must have at least a player name or brand' })
+  }
+
+  function buildQuery(card, gradeSuffix = '') {
+    const parts = []
+    if (card.year)           parts.push(String(card.year).trim())
+    if (card.brand_parallel) parts.push(card.brand_parallel.trim())
+    if (card.player_name)    parts.push(card.player_name.trim())
+    if (card.card_number)    parts.push(`#${String(card.card_number).trim()}`)
+    if (card.numbered) {
+      const match = String(card.numbered).match(/\/(\d+)/)
+      if (match) parts.push(`/${match[1]}`)
+      else parts.push(String(card.numbered).trim())
+    }
+    if (gradeSuffix) parts.push(gradeSuffix)
+    return parts.join(' ')
+  }
+
+  function buildWeeklyBuckets(items) {
+    const now = new Date()
+    const buckets = Array.from({ length: 8 }, (_, i) => {
+      const weekStart = new Date(now)
+      weekStart.setDate(now.getDate() - (7 * (7 - i)))
+      const weekEnd = new Date(weekStart)
+      weekEnd.setDate(weekStart.getDate() + 7)
+      return { weekStart, weekEnd, prices: [], label: `W${i + 1}` }
+    })
+    items.forEach(item => {
+      if (!item.date) return
+      const d = new Date(item.date)
+      buckets.forEach(bucket => {
+        if (d >= bucket.weekStart && d < bucket.weekEnd) bucket.prices.push(item.price)
+      })
+    })
+    return buckets.map(b => ({
+      label: b.label,
+      avg: b.prices.length ? parseFloat((b.prices.reduce((s, p) => s + p, 0) / b.prices.length).toFixed(2)) : null,
+      count: b.prices.length,
+    }))
+  }
+
   try {
-    const { player, brand, year, cardNum } = req.query
-    if (!player) return res.status(400).json({ error: 'player is required' })
+    const token = await getEbayToken()
+    const rawQuery   = buildQuery(card, '')
+    const psa9Query  = buildQuery(card, 'PSA 9')
+    const psa10Query = buildQuery(card, 'PSA 10')
 
-    console.log(`Fetching 3-tier comps: ${player} ${year} ${brand} #${cardNum}`)
+    console.log('[Comps] Raw query:', rawQuery)
+    console.log('[Comps] PSA 9 query:', psa9Query)
+    console.log('[Comps] PSA 10 query:', psa10Query)
 
-    // Run all 3 queries in parallel
     const [rawItems, psa9Items, psa10Items] = await Promise.all([
-      fetchItems(buildRawQuery(player, year, brand, cardNum), 80).catch(e => { console.error('Raw fetch error:', e.message); return [] }),
-      fetchItems(buildGradedQuery(player, year, brand, cardNum, '9'), 60).catch(e => { console.error('PSA9 fetch error:', e.message); return [] }),
-      fetchItems(buildGradedQuery(player, year, brand, cardNum, '10'), 60).catch(e => { console.error('PSA10 fetch error:', e.message); return [] })
+      fetchItems(rawQuery, 50),
+      fetchItems(psa9Query, 50),
+      fetchItems(psa10Query, 50),
     ])
 
-    function tierResult(items, label) {
-      const comps = parseItems(items)
-      const stats = calcStats(comps.map(c => c.price))
-      const recent = comps.filter(c => c.daysAgo <= 30)
-      const older = comps.filter(c => c.daysAgo > 30 && c.daysAgo <= 60)
-      const rStats = calcStats(recent.map(c => c.price))
-      const oStats = calcStats(older.map(c => c.price))
-      let trend = null, trendLabel = 'Not enough data'
-      if (rStats && oStats && oStats.avg > 0) {
-        trend = Math.round(((rStats.avg - oStats.avg) / oStats.avg * 100) * 10) / 10
-        trendLabel = trend > 0 ? `↑ ${Math.abs(trend)}% vs 30-60d` : `↓ ${Math.abs(trend)}% vs 30-60d`
-      }
-      return {
-        label,
-        count: comps.length,
-        avg: stats?.avg || null,
-        median: stats?.median || null,
-        high: stats?.high || null,
-        low: stats?.low || null,
-        recommended: rStats?.recommended || stats?.recommended || null,
-        trend,
-        trendLabel,
-        comps: comps.slice(0, 8)
-      }
+    // Filter graded cards out of raw results
+    const rawFiltered = rawItems.filter(i => !/\b(PSA|BGS|SGC|CGC)\b/i.test(i.title || ''))
+
+    function iqrFilter(prices) {
+      if (prices.length < 4) return prices
+      const sorted = [...prices].sort((a, b) => a - b)
+      const q1 = sorted[Math.floor(sorted.length * 0.25)]
+      const q3 = sorted[Math.floor(sorted.length * 0.75)]
+      const iqr = q3 - q1
+      return prices.filter(p => p >= q1 - 1.5 * iqr && p <= q3 + 1.5 * iqr)
     }
 
+    function medianOf(prices) {
+      if (!prices.length) return null
+      const s = [...prices].sort((a, b) => a - b)
+      const m = Math.floor(s.length / 2)
+      return s.length % 2 !== 0 ? s[m] : (s[m - 1] + s[m]) / 2
+    }
+
+    function toItems(rawList) {
+      return rawList.map(i => ({
+        price: parseFloat(i.price?.value || i.price || 0),
+        date:  i.itemEndDate || i.date || null,
+        title: i.title || '',
+        url:   i.itemWebUrl || i.url || '',
+      })).filter(i => i.price > 0)
+    }
+
+    const rawComp   = toItems(rawFiltered)
+    const psa9Comp  = toItems(psa9Items)
+    const psa10Comp = toItems(psa10Items)
+
+    const rawPrices   = iqrFilter(rawComp.map(i => i.price))
+    const psa9Prices  = iqrFilter(psa9Comp.map(i => i.price))
+    const psa10Prices = iqrFilter(psa10Comp.map(i => i.price))
+
     res.json({
-      player, brand, year, cardNum,
-      raw: tierResult(rawItems, 'Raw'),
-      psa9: tierResult(psa9Items, 'PSA 9'),
-      psa10: tierResult(psa10Items, 'PSA 10'),
-      fetchedAt: new Date().toISOString()
+      raw: {
+        query: rawQuery, median: medianOf(rawPrices),
+        count: rawComp.length, filteredCount: rawPrices.length,
+        items: rawComp.slice(0, 10), weeklyTrend: buildWeeklyBuckets(rawComp),
+      },
+      psa9: {
+        query: psa9Query, median: medianOf(psa9Prices),
+        count: psa9Comp.length, filteredCount: psa9Prices.length,
+        items: psa9Comp.slice(0, 10), weeklyTrend: buildWeeklyBuckets(psa9Comp),
+      },
+      psa10: {
+        query: psa10Query, median: medianOf(psa10Prices),
+        count: psa10Comp.length, filteredCount: psa10Prices.length,
+        items: psa10Comp.slice(0, 10), weeklyTrend: buildWeeklyBuckets(psa10Comp),
+      },
     })
   } catch (err) {
-    console.error('Tier comps error:', err.message)
-    res.status(500).json({ error: err.message })
+    console.error('[Comps] Tiers error:', err?.response?.data || err.message)
+    res.status(500).json({ error: 'Failed to fetch comps', detail: err?.response?.data?.errors?.[0]?.message || err.message })
+  }
+})
+
+// APPROVE COMPS — save to Supabase + enable auto-refresh
+app.post('/api/comps/approve', async (req, res) => {
+  const { cardId, raw, psa9, psa10, autoRefresh } = req.body
+  if (!cardId) return res.status(400).json({ error: 'cardId required' })
+  try {
+    const now = new Date().toISOString()
+    const { data: existing } = await supabase.from('cards').select('comp_history').eq('id', cardId).single()
+    const prevHistory = existing?.comp_history || []
+    const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null }].slice(-52)
+    const { error } = await supabase.from('cards').update({
+      comp_raw: raw ?? null, comp_psa9: psa9 ?? null, comp_psa10: psa10 ?? null,
+      comp_auto_refresh: autoRefresh ?? false,
+      comp_last_refreshed: now, comp_history: updatedHistory,
+    }).eq('id', cardId)
+    if (error) throw error
+    res.json({ success: true, lastRefreshed: now })
+  } catch (err) {
+    console.error('[Comps] Approve error:', err.message)
+    res.status(500).json({ error: 'Failed to save comps', detail: err.message })
   }
 })
 
@@ -327,6 +424,39 @@ app.post('/api/comps/bulk', async (req, res) => {
     res.json({ results, processed: results.length })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
+
+// Weekly comp auto-refresh — runs Sundays 2 AM Mountain Time
+cron.schedule('0 8 * * 0', async () => {
+  console.log('[CronRefresh] Starting weekly comp refresh —', new Date().toISOString())
+  try {
+    const { data: cards } = await supabase.from('cards')
+      .select('id, player_name, brand_parallel, card_number, year, numbered, comp_raw, comp_psa9, comp_psa10, comp_history')
+      .eq('comp_auto_refresh', true)
+    if (!cards || cards.length === 0) return console.log('[CronRefresh] No cards to refresh')
+    console.log(`[CronRefresh] Refreshing ${cards.length} cards`)
+    for (const card of cards) {
+      try {
+        const r = await fetch('https://gradeedge-api-production.up.railway.app/api/comps/tiers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ card })
+        })
+        const { raw, psa9, psa10 } = await r.json()
+        const now = new Date().toISOString()
+        const history = [...(card.comp_history || []), { date: now, raw: raw?.median ?? null, psa9: psa9?.median ?? null, psa10: psa10?.median ?? null }].slice(-52)
+        await supabase.from('cards').update({
+          comp_raw: raw?.median ?? card.comp_raw,
+          comp_psa9: psa9?.median ?? card.comp_psa9,
+          comp_psa10: psa10?.median ?? card.comp_psa10,
+          comp_last_refreshed: now,
+          comp_history: history
+        }).eq('id', card.id)
+        console.log(`[CronRefresh] ✅ ${card.player_name}`)
+        await new Promise(r => setTimeout(r, 2000))
+      } catch (e) { console.error(`[CronRefresh] ❌ ${card.id}:`, e.message) }
+    }
+  } catch (e) { console.error('[CronRefresh] Fatal:', e.message) }
+}, { timezone: 'America/Denver' })
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
