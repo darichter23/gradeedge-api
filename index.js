@@ -13,6 +13,8 @@ app.use(express.json({ limit: '10mb' }))
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } })
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+const { createClient } = require('@supabase/supabase-js')
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
 
 // ── eBay OAuth token cache ──────────────────────────────────────────────────
 let ebayToken = null
