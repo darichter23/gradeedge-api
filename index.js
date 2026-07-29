@@ -377,25 +377,36 @@ app.post('/api/comps/approve', async (req, res) => {
 })
 
 // ── AI Card Scanner ─────────────────────────────────────────────────────────
-app.post('/api/scan', upload.single('image'), async (req, res) => {
+app.post('/api/scan', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
   try {
-    let imageBase64, mediaType
-    if (req.file) {
-      imageBase64 = req.file.buffer.toString('base64')
-      mediaType = req.file.mimetype || 'image/jpeg'
-    } else if (req.body.image) {
-      const match = req.body.image.match(/^data:([^;]+);base64,(.+)$/)
-      if (match) { mediaType = match[1]; imageBase64 = match[2] }
-      else { imageBase64 = req.body.image; mediaType = 'image/jpeg' }
-    } else {
-      return res.status(400).json({ error: 'No image provided' })
+    function extractImage(fileField, bodyField) {
+      if (req.files && req.files[fileField] && req.files[fileField][0]) {
+        const f = req.files[fileField][0]
+        return { mediaType: f.mimetype || 'image/jpeg', base64: f.buffer.toString('base64') }
+      }
+      if (req.body[bodyField]) {
+        const match = req.body[bodyField].match(/^data:([^;]+);base64,(.+)$/)
+        if (match) return { mediaType: match[1], base64: match[2] }
+        return { mediaType: 'image/jpeg', base64: req.body[bodyField] }
+      }
+      return null
     }
+    const front = extractImage('image', 'image')
+    const back = extractImage('imageBack', 'imageBack')
+    if (!front) return res.status(400).json({ error: 'No front image provided' })
+
+    const content = [
+      { type: 'image', source: { type: 'base64', media_type: front.mediaType, data: front.base64 } }
+    ]
+    if (back) content.push({ type: 'image', source: { type: 'base64', media_type: back.mediaType, data: back.base64 } })
+    content.push({ type: 'text', text: back
+      ? 'You are a sports card expert. The first image is the FRONT of the card, the second image is the BACK. Use both to identify the card as accurately as possible — the back often has set/copyright info, and PSA/graded labels are on the slab holder which may be visible in either image. Return ONLY valid JSON with no markdown: {"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}'
+      : 'You are a sports card expert. Analyze this card image and return ONLY valid JSON with no markdown: {"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}'
+    })
+
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6', max_tokens: 500,
-      messages: [{ role: 'user', content: [
-        { type: 'image', source: { type: 'base64', media_type: mediaType, data: imageBase64 } },
-        { type: 'text', text: 'You are a sports card expert. Analyze this card image and return ONLY valid JSON with no markdown: {"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}' }
-      ]}]
+      model: 'claude-sonnet-5', max_tokens: 500,
+      messages: [{ role: 'user', content }]
     })
     const responseText = message.content[0].text.trim()
     let cardData
