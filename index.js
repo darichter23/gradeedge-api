@@ -42,7 +42,7 @@ async function getEbayToken() {
   return ebayToken
 }
 
-// ── Core eBay Browse API fetcher ────────────────────────────────────────────
+// ── Core eBay Browse API fetcher (still used by /api/comps single-grade lookup + /api/comps/bulk) ─
 async function fetchItems(query, limit) {
   limit = limit || 100
   const token = await getEbayToken()
@@ -75,24 +75,20 @@ async function fetchItems(query, limit) {
     throw new Error('eBay API error: ' + warn.message)
   }
   const items = data.itemSummaries || []
-  console.log(`  → ${items.length} items for: ${query}`)
+  console.log(` → ${items.length} items for: ${query}`)
   return items
 }
 
 // ── Build precise eBay search queries per grade tier ───────────────────────
-// Raw: exclude PSA/BGS/SGC/CGC, include card number and base brand only
-// PSA 9 / PSA 10: include "PSA 9" or "PSA 10" in query
 function buildRawQuery(player, year, brand, cardNum) {
   const parts = []
   if (player) parts.push(player.trim())
   if (year) parts.push(String(year))
   if (brand) {
-    // Use first 2 words of brand to avoid over-restricting (e.g. "Topps Chrome" not full parallel name)
     const words = brand.trim().split(/\s+/).slice(0, 2).join(' ')
     parts.push(words)
   }
   if (cardNum) parts.push('#' + String(cardNum).replace(/^#/, ''))
-  // Explicitly exclude graded slabs from raw search
   const q = parts.join(' ')
   return q + ' -PSA -BGS -SGC -CGC -graded'
 }
@@ -123,10 +119,9 @@ function calcStats(prices) {
     const lo = q1 - 1.5 * iqr
     const hi = q3 + 1.5 * iqr
     cleaned = sorted.filter(p => p >= lo && p <= hi)
-    if (cleaned.length < 3) cleaned = sorted // don't over-filter small sets
+    if (cleaned.length < 3) cleaned = sorted
   }
 
-  // Additional 10% trim on large sets
   let w = cleaned
   if (cleaned.length >= 8) {
     const t = Math.max(1, Math.floor(cleaned.length * 0.1))
@@ -166,22 +161,85 @@ function parseItems(rawItems) {
   }).filter(c => c.price > 1).sort((a, b) => a.daysAgo - b.daysAgo)
 }
 
+// ── SportsCardsPro helpers (sold-price based — primary comp source) ────────
+async function scpFetch(path, params) {
+  const token = process.env.SPORTSCARDSPRO_API_TOKEN
+  if (!token) throw new Error('SPORTSCARDSPRO_API_TOKEN not set')
+  const url = new URL(`https://www.sportscardspro.com/api/${path}`)
+  url.searchParams.set('t', token)
+  Object.entries(params).forEach(([k, v]) => { if (v != null && v !== '') url.searchParams.set(k, v) })
+  const r = await fetch(url.toString())
+  if (!r.ok) throw new Error(`SportsCardsPro API error: ${r.status}`)
+  return r.json()
+}
+const centsToDollars = v => (v == null ? null : Math.round(v) / 100)
+
+// Look up a single card's full multi-grade comp set from SportsCardsPro.
+// Two sequential API calls (search then detail) — internally paced to respect SCP's 1 req/sec limit.
+async function fetchTiersFromSCP(card) {
+  const words = card.brand_parallel ? String(card.brand_parallel).trim().split(/\s+/).slice(0, 2).join(' ') : ''
+  const q = [
+    card.year,
+    words,
+    card.player_name,
+    card.card_number ? '#' + String(card.card_number).replace(/^#/, '') : ''
+  ].filter(Boolean).join(' ').trim()
+
+  if (!q) return { matched: false, query: q }
+
+  const search = await scpFetch('products', { q })
+  if (search.status !== 'success' || !search.products?.length) return { matched: false, query: q }
+
+  await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+
+  const detail = await scpFetch('product', { id: search.products[0].id })
+  if (detail.status !== 'success') return { matched: false, query: q }
+
+  return {
+    matched: true,
+    query: q,
+    matchedProduct: detail['product-name'],
+    matchedSet: detail['console-name'],
+    productId: detail.id,
+    raw: centsToDollars(detail['loose-price']),
+    psa8: centsToDollars(detail['new-price']),
+    psa9: centsToDollars(detail['graded-price']),
+    psa10: centsToDollars(detail['manual-only-price']),
+    bgs10: centsToDollars(detail['bgs-10-price']),
+    cgc10: centsToDollars(detail['condition-17-price']),
+    sgc10: centsToDollars(detail['condition-18-price']),
+    salesVolume: detail['sales-volume'] ?? null,
+  }
+}
+
+// Build a sparkline-compatible weekly trend from our own stored comp_history snapshots.
+// SportsCardsPro's API only exposes current aggregate values (no per-sale historical listings),
+// so trend continuity now comes from what we save on each refresh, accumulating over time.
+function buildWeeklyTrendFromHistory(history, key) {
+  if (!Array.isArray(history) || !history.length) return []
+  return history.slice(-8).map((h, i) => ({
+    label: `W${i + 1}`,
+    avg: h[key] != null ? Number(h[key]) : null,
+    count: h[key] != null ? 1 : 0,
+  }))
+}
+
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '6.0.0' })
+  res.json({ status: 'GradeEdge API running', version: '7.0.0' })
 })
 
-// Single-grade comp (used by edit modal / LiveCompFetcher)
+// Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
 app.get('/api/comps', async (req, res) => {
   try {
     const { player, brand, year, grade, cardNum, numbered } = req.query
     if (!player) return res.status(400).json({ error: 'player is required' })
 
     const parts = []
-    if (year)     parts.push(String(year).trim())
-    if (brand)    parts.push(brand.trim())
-    if (player)   parts.push(player.trim())
-    if (cardNum)  parts.push(`#${String(cardNum).trim()}`)
+    if (year) parts.push(String(year).trim())
+    if (brand) parts.push(brand.trim())
+    if (player) parts.push(player.trim())
+    if (cardNum) parts.push(`#${String(cardNum).trim()}`)
     if (numbered) {
       const match = String(numbered).match(/\/(\d+)/)
       if (match) parts.push(`/${match[1]}`)
@@ -205,7 +263,7 @@ app.get('/api/comps', async (req, res) => {
 
     const comps = parseItems(rawItems)
     const recent = comps.filter(c => c.daysAgo <= 30)
-    const older  = comps.filter(c => c.daysAgo > 30 && c.daysAgo <= 60)
+    const older = comps.filter(c => c.daysAgo > 30 && c.daysAgo <= 60)
     const aStats = calcStats(comps.map(c => c.price))
     const rStats = calcStats(recent.map(c => c.price))
     const oStats = calcStats(older.map(c => c.price))
@@ -233,7 +291,10 @@ app.get('/api/comps', async (req, res) => {
   }
 })
 
-// THREE-TIER COMP: Raw + PSA 9 + PSA 10 in one call
+// THREE-TIER COMP: Raw + PSA 9 + PSA 10 in one call.
+// Primary automated comp source — powers the inventory table columns, Approve & Save,
+// the weekly auto-refresh cron, and the Sell/Watch/Hold signal.
+// Migrated from eBay Browse API (active listings) to SportsCardsPro (sold-price based) for accuracy.
 app.post('/api/comps/tiers', async (req, res) => {
   const { card } = req.body
   if (!card) return res.status(400).json({ error: 'Card data is required' })
@@ -241,116 +302,33 @@ app.post('/api/comps/tiers', async (req, res) => {
     return res.status(400).json({ error: 'Card must have at least a player name or brand' })
   }
 
-  function buildQuery(card, gradeSuffix = '') {
-    const parts = []
-    if (card.year)           parts.push(String(card.year).trim())
-    if (card.brand_parallel) parts.push(card.brand_parallel.trim())
-    if (card.player_name)    parts.push(card.player_name.trim())
-    if (card.card_number)    parts.push(`#${String(card.card_number).trim()}`)
-    if (card.numbered) {
-      const match = String(card.numbered).match(/\/(\d+)/)
-      if (match) parts.push(`/${match[1]}`)
-      else parts.push(String(card.numbered).trim())
-    }
-    if (gradeSuffix) parts.push(gradeSuffix)
-    return parts.join(' ')
-  }
-
-  function buildWeeklyBuckets(items) {
-    const now = new Date()
-    const buckets = Array.from({ length: 8 }, (_, i) => {
-      const weekStart = new Date(now)
-      weekStart.setDate(now.getDate() - (7 * (7 - i)))
-      const weekEnd = new Date(weekStart)
-      weekEnd.setDate(weekStart.getDate() + 7)
-      return { weekStart, weekEnd, prices: [], label: `W${i + 1}` }
-    })
-    items.forEach(item => {
-      if (!item.date) return
-      const d = new Date(item.date)
-      buckets.forEach(bucket => {
-        if (d >= bucket.weekStart && d < bucket.weekEnd) bucket.prices.push(item.price)
-      })
-    })
-    return buckets.map(b => ({
-      label: b.label,
-      avg: b.prices.length ? parseFloat((b.prices.reduce((s, p) => s + p, 0) / b.prices.length).toFixed(2)) : null,
-      count: b.prices.length,
-    }))
-  }
-
   try {
-    const token = await getEbayToken()
-    const rawQuery   = buildQuery(card, '')
-    const psa9Query  = buildQuery(card, 'PSA 9')
-    const psa10Query = buildQuery(card, 'PSA 10')
+    const scp = await fetchTiersFromSCP(card)
+    const history = card.comp_history || []
 
-    console.log('[Comps] Raw query:', rawQuery)
-    console.log('[Comps] PSA 9 query:', psa9Query)
-    console.log('[Comps] PSA 10 query:', psa10Query)
-
-    const [rawItems, psa9Items, psa10Items] = await Promise.all([
-      fetchItems(rawQuery, 50),
-      fetchItems(psa9Query, 50),
-      fetchItems(psa10Query, 50),
-    ])
-
-    // Filter graded cards out of raw results
-    const rawFiltered = rawItems.filter(i => !/\b(PSA|BGS|SGC|CGC)\b/i.test(i.title || ''))
-
-    function iqrFilter(prices) {
-      if (prices.length < 4) return prices
-      const sorted = [...prices].sort((a, b) => a - b)
-      const q1 = sorted[Math.floor(sorted.length * 0.25)]
-      const q3 = sorted[Math.floor(sorted.length * 0.75)]
-      const iqr = q3 - q1
-      return prices.filter(p => p >= q1 - 1.5 * iqr && p <= q3 + 1.5 * iqr)
+    if (!scp.matched) {
+      return res.json({
+        raw: { query: scp.query, median: null, count: 0, filteredCount: 0, items: [], weeklyTrend: buildWeeklyTrendFromHistory(history, 'raw') },
+        psa9: { query: scp.query, median: null, count: 0, filteredCount: 0, items: [], weeklyTrend: buildWeeklyTrendFromHistory(history, 'psa9') },
+        psa10: { query: scp.query, median: null, count: 0, filteredCount: 0, items: [], weeklyTrend: buildWeeklyTrendFromHistory(history, 'psa10') },
+        source: 'SportsCardsPro',
+        matched: false,
+      })
     }
-
-    function medianOf(prices) {
-      if (!prices.length) return null
-      const s = [...prices].sort((a, b) => a - b)
-      const m = Math.floor(s.length / 2)
-      return s.length % 2 !== 0 ? s[m] : (s[m - 1] + s[m]) / 2
-    }
-
-    function toItems(rawList) {
-      return rawList.map(i => ({
-        price: parseFloat(i.price?.value || i.price || 0),
-        date:  i.itemEndDate || i.date || null,
-        title: i.title || '',
-        url:   i.itemWebUrl || i.url || '',
-      })).filter(i => i.price > 0)
-    }
-
-    const rawComp   = toItems(rawFiltered)
-    const psa9Comp  = toItems(psa9Items)
-    const psa10Comp = toItems(psa10Items)
-
-    const rawPrices   = iqrFilter(rawComp.map(i => i.price))
-    const psa9Prices  = iqrFilter(psa9Comp.map(i => i.price))
-    const psa10Prices = iqrFilter(psa10Comp.map(i => i.price))
 
     res.json({
-      raw: {
-        query: rawQuery, median: medianOf(rawPrices),
-        count: rawComp.length, filteredCount: rawPrices.length,
-        items: rawComp.slice(0, 10), weeklyTrend: buildWeeklyBuckets(rawComp),
-      },
-      psa9: {
-        query: psa9Query, median: medianOf(psa9Prices),
-        count: psa9Comp.length, filteredCount: psa9Prices.length,
-        items: psa9Comp.slice(0, 10), weeklyTrend: buildWeeklyBuckets(psa9Comp),
-      },
-      psa10: {
-        query: psa10Query, median: medianOf(psa10Prices),
-        count: psa10Comp.length, filteredCount: psa10Prices.length,
-        items: psa10Comp.slice(0, 10), weeklyTrend: buildWeeklyBuckets(psa10Comp),
-      },
+      raw: { query: scp.query, median: scp.raw, count: scp.salesVolume || 0, filteredCount: scp.salesVolume || 0, items: [], weeklyTrend: buildWeeklyTrendFromHistory(history, 'raw') },
+      psa9: { query: scp.query, median: scp.psa9, count: scp.salesVolume || 0, filteredCount: scp.salesVolume || 0, items: [], weeklyTrend: buildWeeklyTrendFromHistory(history, 'psa9') },
+      psa10: { query: scp.query, median: scp.psa10, count: scp.salesVolume || 0, filteredCount: scp.salesVolume || 0, items: [], weeklyTrend: buildWeeklyTrendFromHistory(history, 'psa10') },
+      matchedProduct: scp.matchedProduct,
+      matchedSet: scp.matchedSet,
+      psa8: scp.psa8, bgs10: scp.bgs10, cgc10: scp.cgc10, sgc10: scp.sgc10,
+      source: 'SportsCardsPro',
+      matched: true,
     })
   } catch (err) {
-    console.error('[Comps] Tiers error:', err?.response?.data || err.message)
-    res.status(500).json({ error: 'Failed to fetch comps', detail: err?.response?.data?.errors?.[0]?.message || err.message })
+    console.error('[Comps] Tiers error (SCP):', err?.message)
+    res.status(500).json({ error: 'Failed to fetch comps', detail: err.message })
   }
 })
 
@@ -362,9 +340,10 @@ app.post('/api/comps/approve', async (req, res) => {
     const now = new Date().toISOString()
     const { data: existing } = await supabase.from('cards').select('comp_history').eq('id', cardId).single()
     const prevHistory = existing?.comp_history || []
-    const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null }].slice(-52)
+    const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null, source: 'SportsCardsPro' }].slice(-52)
     const { error } = await supabase.from('cards').update({
       comp_raw: raw ?? null, comp_psa9: psa9 ?? null, comp_psa10: psa10 ?? null,
+      comp_source: 'SportsCardsPro',
       comp_auto_refresh: autoRefresh ?? false,
       comp_last_refreshed: now, comp_history: updatedHistory,
     }).eq('id', cardId)
@@ -418,7 +397,7 @@ app.post('/api/scan', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'im
   }
 })
 
-// ── Bulk Comps ──────────────────────────────────────────────────────────────
+// ── Bulk Comps (legacy eBay path — small manual batches, unrelated to the SCP backfill below) ──
 app.post('/api/comps/bulk', async (req, res) => {
   try {
     const { cards } = req.body
@@ -438,19 +417,7 @@ app.post('/api/comps/bulk', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// ── SportsCardsPro multi-grade pricing (raw / PSA / BGS / CGC / SGC) ───────
-async function scpFetch(path, params) {
-  const token = process.env.SPORTSCARDSPRO_API_TOKEN
-  if (!token) throw new Error('SPORTSCARDSPRO_API_TOKEN not set')
-  const url = new URL(`https://www.sportscardspro.com/api/${path}`)
-  url.searchParams.set('t', token)
-  Object.entries(params).forEach(([k, v]) => { if (v != null && v !== '') url.searchParams.set(k, v) })
-  const r = await fetch(url.toString())
-  if (!r.ok) throw new Error(`SportsCardsPro API error: ${r.status}`)
-  return r.json()
-}
-const centsToDollars = v => (v == null ? null : Math.round(v) / 100)
-
+// ── SportsCardsPro multi-grade pricing (raw / PSA / BGS / CGC / SGC) — on-demand lookup tool ──
 app.get('/api/comps/multigrade', async (req, res) => {
   try {
     const { player, year, brand, cardNum } = req.query
@@ -480,9 +447,49 @@ app.get('/api/comps/multigrade', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-// Weekly comp auto-refresh — runs Sundays 2 AM Mountain Time
+// ── ONE-TIME BULK BACKFILL: re-pull every card's comps via SportsCardsPro ─────────────────
+// So old (eBay-sourced) and new comps are consistent platform-wide. Fire-and-forget background job —
+// responds immediately with a count, then processes sequentially respecting SCP's rate limit.
+app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
+  try {
+    const { data: cards, error } = await supabase.from('cards')
+      .select('id, player_name, brand_parallel, card_number, year, numbered, comp_history')
+    if (error) throw error
+    res.json({ started: true, totalCards: cards.length })
+
+    ;(async () => {
+      let ok = 0, notFound = 0, fail = 0
+      for (const card of cards) {
+        try {
+          const scp = await fetchTiersFromSCP(card)
+          const now = new Date().toISOString()
+          if (!scp.matched) {
+            notFound++
+            console.log(`[BulkSCP] no match: ${card.player_name} (${card.id})`)
+          } else {
+            const history = [...(card.comp_history || []), { date: now, raw: scp.raw, psa9: scp.psa9, psa10: scp.psa10, source: 'SportsCardsPro' }].slice(-52)
+            await supabase.from('cards').update({
+              comp_raw: scp.raw, comp_psa9: scp.psa9, comp_psa10: scp.psa10,
+              comp_source: 'SportsCardsPro', comp_last_refreshed: now, comp_history: history,
+            }).eq('id', card.id)
+            ok++
+            console.log(`[BulkSCP] ✅ ${card.player_name} raw=${scp.raw} psa9=${scp.psa9} psa10=${scp.psa10}`)
+          }
+        } catch (e) {
+          fail++
+          console.error(`[BulkSCP] ❌ ${card.id}:`, e.message)
+        }
+        await new Promise(r => setTimeout(r, 1100))
+      }
+      console.log(`[BulkSCP] Backfill complete — ok:${ok} notFound:${notFound} fail:${fail}`)
+    })()
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// Weekly comp auto-refresh — runs Sundays 2 AM Mountain Time.
+// Now pulls through /api/comps/tiers, which is SportsCardsPro-backed as of this deploy.
 cron.schedule('0 2 * * 0', async () => {
-  console.log('[CronRefresh] Starting weekly comp refresh —', new Date().toISOString())
+  console.log('[CronRefresh] Starting weekly comp refresh (SportsCardsPro) —', new Date().toISOString())
   try {
     const { data: cards } = await supabase.from('cards')
       .select('id, player_name, brand_parallel, card_number, year, numbered, comp_raw, comp_psa9, comp_psa10, comp_history')
@@ -498,16 +505,17 @@ cron.schedule('0 2 * * 0', async () => {
         })
         const { raw, psa9, psa10 } = await r.json()
         const now = new Date().toISOString()
-        const history = [...(card.comp_history || []), { date: now, raw: raw?.median ?? null, psa9: psa9?.median ?? null, psa10: psa10?.median ?? null }].slice(-52)
+        const history = [...(card.comp_history || []), { date: now, raw: raw?.median ?? null, psa9: psa9?.median ?? null, psa10: psa10?.median ?? null, source: 'SportsCardsPro' }].slice(-52)
         await supabase.from('cards').update({
           comp_raw: raw?.median ?? card.comp_raw,
           comp_psa9: psa9?.median ?? card.comp_psa9,
           comp_psa10: psa10?.median ?? card.comp_psa10,
+          comp_source: 'SportsCardsPro',
           comp_last_refreshed: now,
           comp_history: history
         }).eq('id', card.id)
         console.log(`[CronRefresh] ✅ ${card.player_name}`)
-        await new Promise(r => setTimeout(r, 2000))
+        await new Promise(r => setTimeout(r, 2200))
       } catch (e) { console.error(`[CronRefresh] ❌ ${card.id}:`, e.message) }
     }
   } catch (e) { console.error('[CronRefresh] Fatal:', e.message) }
@@ -515,8 +523,9 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v6.0.0 running on port ' + PORT)
-  console.log('eBay Client ID configured:', !!process.env.EBAY_CLIENT_ID)
-  console.log('eBay Client Secret configured:', !!process.env.EBAY_CLIENT_SECRET)
+  console.log('GradeEdge API v7.0.0 running on port ' + PORT)
+  console.log('Primary comp source: SportsCardsPro (sold-price based)')
+  console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
+  console.log('eBay Client ID configured (legacy /api/comps + /api/comps/bulk only):', !!process.env.EBAY_CLIENT_ID)
   console.log('Anthropic configured:', !!process.env.ANTHROPIC_API_KEY)
 })
