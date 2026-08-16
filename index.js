@@ -452,9 +452,21 @@ app.get('/api/comps/multigrade', async (req, res) => {
 // responds immediately with a count, then processes sequentially respecting SCP's rate limit.
 app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
   try {
-    const { data: cards, error } = await supabase.from('cards')
-      .select('id, player_name, brand_parallel, card_number, year, numbered, comp_history')
+    // NOTE: actual Supabase column names are player/brand/parallel/card_num (not the
+    // player_name/brand_parallel/card_number naming used internally by fetchTiersFromSCP) —
+    // map them here rather than selecting nonexistent columns.
+    const { data: rows, error } = await supabase.from('cards')
+      .select('id, player, brand, parallel, card_num, year, numbered, comp_history')
     if (error) throw error
+    const cards = rows.map(row => ({
+      id: row.id,
+      player_name: row.player || '',
+      brand_parallel: [row.brand, row.parallel].filter(Boolean).join(' '),
+      card_number: row.card_num || '',
+      year: row.year,
+      numbered: row.numbered,
+      comp_history: row.comp_history,
+    }))
     res.json({ started: true, totalCards: cards.length })
 
     ;(async () => {
@@ -491,10 +503,25 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
 cron.schedule('0 2 * * 0', async () => {
   console.log('[CronRefresh] Starting weekly comp refresh (SportsCardsPro) —', new Date().toISOString())
   try {
-    const { data: cards } = await supabase.from('cards')
-      .select('id, player_name, brand_parallel, card_number, year, numbered, comp_raw, comp_psa9, comp_psa10, comp_history')
+    // NOTE: real Supabase columns are player/brand/parallel/card_num — this select previously
+    // referenced player_name/brand_parallel/card_number, which don't exist on the table, so this
+    // cron has been throwing (and silently doing nothing) on every scheduled run. Fixed here.
+    const { data: rows } = await supabase.from('cards')
+      .select('id, player, brand, parallel, card_num, year, numbered, comp_raw, comp_psa9, comp_psa10, comp_history')
       .eq('comp_auto_refresh', true)
-    if (!cards || cards.length === 0) return console.log('[CronRefresh] No cards to refresh')
+    if (!rows || rows.length === 0) return console.log('[CronRefresh] No cards to refresh')
+    const cards = rows.map(row => ({
+      id: row.id,
+      player_name: row.player || '',
+      brand_parallel: [row.brand, row.parallel].filter(Boolean).join(' '),
+      card_number: row.card_num || '',
+      year: row.year,
+      numbered: row.numbered,
+      comp_raw: row.comp_raw,
+      comp_psa9: row.comp_psa9,
+      comp_psa10: row.comp_psa10,
+      comp_history: row.comp_history,
+    }))
     console.log(`[CronRefresh] Refreshing ${cards.length} cards`)
     for (const card of cards) {
       try {
