@@ -438,6 +438,48 @@ app.post('/api/comps/bulk', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
+// ── SportsCardsPro multi-grade pricing (raw / PSA / BGS / CGC / SGC) ───────
+async function scpFetch(path, params) {
+  const token = process.env.SPORTSCARDSPRO_API_TOKEN
+  if (!token) throw new Error('SPORTSCARDSPRO_API_TOKEN not set')
+  const url = new URL(`https://www.sportscardspro.com/api/${path}`)
+  url.searchParams.set('t', token)
+  Object.entries(params).forEach(([k, v]) => { if (v != null && v !== '') url.searchParams.set(k, v) })
+  const r = await fetch(url.toString())
+  if (!r.ok) throw new Error(`SportsCardsPro API error: ${r.status}`)
+  return r.json()
+}
+const centsToDollars = v => (v == null ? null : Math.round(v) / 100)
+
+app.get('/api/comps/multigrade', async (req, res) => {
+  try {
+    const { player, year, brand, cardNum } = req.query
+    if (!player) return res.status(400).json({ error: 'player is required' })
+    const words = brand ? brand.trim().split(/\s+/).slice(0, 2).join(' ') : ''
+    const q = [year, words, player.trim(), cardNum ? '#' + String(cardNum).replace(/^#/, '') : ''].filter(Boolean).join(' ')
+    const search = await scpFetch('products', { q })
+    if (search.status !== 'success' || !search.products?.length) return res.json({ status: 'not_found', query: q })
+    const detail = await scpFetch('product', { id: search.products[0].id })
+    if (detail.status !== 'success') return res.json({ status: 'not_found', query: q })
+    res.json({
+      status: 'success',
+      query: q,
+      matchedProduct: detail['product-name'],
+      matchedSet: detail['console-name'],
+      productId: detail.id,
+      raw: centsToDollars(detail['loose-price']),
+      psa8: centsToDollars(detail['new-price']),
+      psa9: centsToDollars(detail['graded-price']),
+      psa10: centsToDollars(detail['manual-only-price']),
+      bgs10: centsToDollars(detail['bgs-10-price']),
+      cgc10: centsToDollars(detail['condition-17-price']),
+      sgc10: centsToDollars(detail['condition-18-price']),
+      salesVolume: detail['sales-volume'] ?? null,
+      source: 'SportsCardsPro'
+    })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
 // Weekly comp auto-refresh — runs Sundays 2 AM Mountain Time
 cron.schedule('0 2 * * 0', async () => {
   console.log('[CronRefresh] Starting weekly comp refresh —', new Date().toISOString())
