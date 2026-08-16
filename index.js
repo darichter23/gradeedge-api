@@ -224,6 +224,35 @@ function buildWeeklyTrendFromHistory(history, key) {
   }))
 }
 
+// Which comp tier represents "today's" value for the Sell/Watch/Hold signal, based on the card's
+// current grading state. SCP only gives us raw/PSA9/PSA10 as clean tiers, so grades other than
+// exactly 9 or 10 are anchored to the nearest of those rather than exactly matched.
+function tierKeyForCard(card) {
+  const grade = card.grade != null ? Number(card.grade) : null
+  if (grade == null) return 'raw'
+  if (grade >= 10) return 'psa10'
+  if (grade >= 9) return 'psa9'
+  return 'raw'
+}
+function pickTodayComp(scp, tierKey) {
+  if (!scp.matched) return null
+  return scp[tierKey] ?? null
+}
+
+// Find the comp value closest to 30 days ago in a card's stored history, for the given tier key.
+// Falls back to the oldest available snapshot while history is still thinner than 30 days.
+function find30dAgoValue(history, tierKey) {
+  if (!Array.isArray(history) || !history.length) return null
+  const targetMs = Date.now() - 30 * 24 * 60 * 60 * 1000
+  let best = null, bestDiff = Infinity
+  for (const h of history) {
+    if (h[tierKey] == null || !h.date) continue
+    const diff = Math.abs(new Date(h.date).getTime() - targetMs)
+    if (diff < bestDiff) { bestDiff = diff; best = h[tierKey] }
+  }
+  return best
+}
+
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'GradeEdge API running', version: '7.0.0' })
@@ -338,11 +367,16 @@ app.post('/api/comps/approve', async (req, res) => {
   if (!cardId) return res.status(400).json({ error: 'cardId required' })
   try {
     const now = new Date().toISOString()
-    const { data: existing } = await supabase.from('cards').select('comp_history').eq('id', cardId).single()
+    const { data: existing } = await supabase.from('cards').select('grade, comp_today, comp_30d, comp_history').eq('id', cardId).single()
     const prevHistory = existing?.comp_history || []
     const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null, source: 'SportsCardsPro' }].slice(-52)
+    const tierKey = tierKeyForCard({ grade: existing?.grade })
+    const todayComp = pickTodayComp({ matched: true, raw, psa9, psa10 }, tierKey)
+    const comp30 = find30dAgoValue(prevHistory, tierKey) ?? existing?.comp_30d ?? null
     const { error } = await supabase.from('cards').update({
       comp_raw: raw ?? null, comp_psa9: psa9 ?? null, comp_psa10: psa10 ?? null,
+      comp_today: todayComp ?? existing?.comp_today ?? null,
+      comp_30d: comp30,
       comp_source: 'SportsCardsPro',
       comp_auto_refresh: autoRefresh ?? false,
       comp_last_refreshed: now, comp_history: updatedHistory,
@@ -456,7 +490,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
     // player_name/brand_parallel/card_number naming used internally by fetchTiersFromSCP) —
     // map them here rather than selecting nonexistent columns.
     const { data: rows, error } = await supabase.from('cards')
-      .select('id, player, brand, parallel, card_num, year, numbered, comp_history')
+      .select('id, player, brand, parallel, card_num, year, numbered, grade, comp_today, comp_30d, comp_history')
     if (error) throw error
     const cards = rows.map(row => ({
       id: row.id,
@@ -465,6 +499,9 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
       card_number: row.card_num || '',
       year: row.year,
       numbered: row.numbered,
+      grade: row.grade,
+      comp_today: row.comp_today,
+      comp_30d: row.comp_30d,
       comp_history: row.comp_history,
     }))
     res.json({ started: true, totalCards: cards.length })
@@ -479,13 +516,17 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
             notFound++
             console.log(`[BulkSCP] no match: ${card.player_name} (${card.id})`)
           } else {
+            const tierKey = tierKeyForCard(card)
+            const todayComp = pickTodayComp(scp, tierKey)
+            const comp30 = find30dAgoValue(card.comp_history || [], tierKey) ?? card.comp_30d ?? null
             const history = [...(card.comp_history || []), { date: now, raw: scp.raw, psa9: scp.psa9, psa10: scp.psa10, source: 'SportsCardsPro' }].slice(-52)
             await supabase.from('cards').update({
               comp_raw: scp.raw, comp_psa9: scp.psa9, comp_psa10: scp.psa10,
+              comp_today: todayComp ?? card.comp_today ?? null, comp_30d: comp30,
               comp_source: 'SportsCardsPro', comp_last_refreshed: now, comp_history: history,
             }).eq('id', card.id)
             ok++
-            console.log(`[BulkSCP] ✅ ${card.player_name} raw=${scp.raw} psa9=${scp.psa9} psa10=${scp.psa10}`)
+            console.log(`[BulkSCP] ✅ ${card.player_name} raw=${scp.raw} psa9=${scp.psa9} psa10=${scp.psa10} today(${tierKey})=${todayComp} 30d=${comp30}`)
           }
         } catch (e) {
           fail++
@@ -507,7 +548,7 @@ cron.schedule('0 2 * * 0', async () => {
     // referenced player_name/brand_parallel/card_number, which don't exist on the table, so this
     // cron has been throwing (and silently doing nothing) on every scheduled run. Fixed here.
     const { data: rows } = await supabase.from('cards')
-      .select('id, player, brand, parallel, card_num, year, numbered, comp_raw, comp_psa9, comp_psa10, comp_history')
+      .select('id, player, brand, parallel, card_num, year, numbered, grade, comp_raw, comp_psa9, comp_psa10, comp_today, comp_30d, comp_history')
       .eq('comp_auto_refresh', true)
     if (!rows || rows.length === 0) return console.log('[CronRefresh] No cards to refresh')
     const cards = rows.map(row => ({
@@ -517,9 +558,12 @@ cron.schedule('0 2 * * 0', async () => {
       card_number: row.card_num || '',
       year: row.year,
       numbered: row.numbered,
+      grade: row.grade,
       comp_raw: row.comp_raw,
       comp_psa9: row.comp_psa9,
       comp_psa10: row.comp_psa10,
+      comp_today: row.comp_today,
+      comp_30d: row.comp_30d,
       comp_history: row.comp_history,
     }))
     console.log(`[CronRefresh] Refreshing ${cards.length} cards`)
@@ -530,18 +574,24 @@ cron.schedule('0 2 * * 0', async () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ card })
         })
-        const { raw, psa9, psa10 } = await r.json()
+        const { raw, psa9, psa10, matched } = await r.json()
         const now = new Date().toISOString()
-        const history = [...(card.comp_history || []), { date: now, raw: raw?.median ?? null, psa9: psa9?.median ?? null, psa10: psa10?.median ?? null, source: 'SportsCardsPro' }].slice(-52)
+        const scpFlat = { matched: !!matched, raw: raw?.median ?? null, psa9: psa9?.median ?? null, psa10: psa10?.median ?? null }
+        const tierKey = tierKeyForCard(card)
+        const todayComp = pickTodayComp(scpFlat, tierKey)
+        const comp30 = find30dAgoValue(card.comp_history || [], tierKey) ?? card.comp_30d ?? null
+        const history = [...(card.comp_history || []), { date: now, raw: scpFlat.raw, psa9: scpFlat.psa9, psa10: scpFlat.psa10, source: 'SportsCardsPro' }].slice(-52)
         await supabase.from('cards').update({
-          comp_raw: raw?.median ?? card.comp_raw,
-          comp_psa9: psa9?.median ?? card.comp_psa9,
-          comp_psa10: psa10?.median ?? card.comp_psa10,
+          comp_raw: scpFlat.raw ?? card.comp_raw,
+          comp_psa9: scpFlat.psa9 ?? card.comp_psa9,
+          comp_psa10: scpFlat.psa10 ?? card.comp_psa10,
+          comp_today: todayComp ?? card.comp_today ?? null,
+          comp_30d: comp30,
           comp_source: 'SportsCardsPro',
           comp_last_refreshed: now,
           comp_history: history
         }).eq('id', card.id)
-        console.log(`[CronRefresh] ✅ ${card.player_name}`)
+        console.log(`[CronRefresh] ✅ ${card.player_name} today(${tierKey})=${todayComp} 30d=${comp30}`)
         await new Promise(r => setTimeout(r, 2200))
       } catch (e) { console.error(`[CronRefresh] ❌ ${card.id}:`, e.message) }
     }
