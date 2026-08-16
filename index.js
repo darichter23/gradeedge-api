@@ -439,7 +439,7 @@ app.post('/api/comps/bulk', async (req, res) => {
 })
 
 // Weekly comp auto-refresh — runs Sundays 2 AM Mountain Time
-cron.schedule('0 8 * * 0', async () => {
+cron.schedule('0 2 * * 0', async () => {
   console.log('[CronRefresh] Starting weekly comp refresh —', new Date().toISOString())
   try {
     const { data: cards } = await supabase.from('cards')
