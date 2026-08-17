@@ -366,7 +366,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.7.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.8.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -652,28 +652,32 @@ app.post('/api/comps/bulk', async (req, res) => {
 // ── SportsCardsPro multi-grade pricing (raw / PSA / BGS / CGC / SGC) — on-demand lookup tool ──
 app.get('/api/comps/multigrade', async (req, res) => {
   try {
-    const { player, year, brand, cardNum } = req.query
+    const { player, year, brand, cardNum, parallel, numbered } = req.query
     if (!player) return res.status(400).json({ error: 'player is required' })
-    const brandFull = brand ? brand.trim().replace(/\s+/g, ' ') : ''
+    const brandFull = brand ? String(brand).trim() : ''
+    const parallelFull = parallel ? String(parallel).trim() : ''
+    const brandParallel = [brandFull, parallelFull].filter(Boolean).join(' ')
     const cardNumStr = cardNum ? '#' + String(cardNum).replace(/^#/, '') : ''
-    const lastName = player.trim().split(/\s+/).pop() || ''
-
-    // Try progressively broader queries so an unusual brand/parallel wording or a card-number
-    // format mismatch doesn't zero out comps that genuinely exist on SportsCardsPro.
+    const playerTrim = String(player).trim()
+    // Try progressively broader queries so a slightly-off set name or missing card number
+    // doesn't zero out comps that genuinely exist on SportsCardsPro.
     const attemptParts = [
-      [year, brandFull, player.trim(), cardNumStr],
-      [year, brandFull, player.trim()],
-      [year, player.trim()],
+      [year, brandParallel, playerTrim, cardNumStr],
+      [year, brandParallel, playerTrim],
+      [year, brandFull, playerTrim, cardNumStr],
+      [year, brandFull, playerTrim],
+      [year, playerTrim],
     ]
-
     const seen = new Set()
     let lastQuery = ''
+    const lastName = playerTrim.split(/\s+/).pop() || ''
+    const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+    const isParallelProduct = name => /\[[^\]]+\]/.test(String(name || ''))
+
     for (const parts of attemptParts) {
       const q = parts.filter(Boolean).join(' ').trim()
       if (!q || seen.has(q)) continue
-      seen.add(q)
-      lastQuery = q
-
+      seen.add(q); lastQuery = q
       const search = await scpFetch('products', { q })
       if (search.status === 'success' && search.products?.length) {
         // Guard against SCP's search returning an unrelated player's card for a shared insert
@@ -681,51 +685,62 @@ app.get('/api/comps/multigrade', async (req, res) => {
         const nameMatches = lastName
           ? search.products.filter(p => String(p['product-name'] || '').toLowerCase().includes(lastName.toLowerCase()))
           : search.products
-        const pool = nameMatches.length ? nameMatches : (lastName ? [] : search.products)
-
+        let pool = nameMatches.length ? nameMatches : (lastName ? [] : search.products)
         if (pool.length) {
-          let best = pool[0]
-          if (cardNumStr) {
-            const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
-            const num = norm(cardNumStr)
-            const withNum = pool.find(p => norm(p['product-name'] || '').includes(num))
-            if (withNum) best = withNum
+          // Parallel-aware filtering: if the user specified a parallel/variation, prefer products
+          // naming it; if they left it blank, prefer the base (non-bracketed) product over parallel
+          // variants like "[Gold]" so we don't silently price a $8500 Gold parallel as if it were base.
+          if (parallelFull) {
+            const parallelLower = parallelFull.toLowerCase()
+            const withParallel = pool.filter(p => String(p['product-name'] || '').toLowerCase().includes(parallelLower))
+            if (withParallel.length) pool = withParallel
+          } else {
+            const base = pool.filter(p => !isParallelProduct(p['product-name']))
+            if (base.length) pool = base
           }
-
-          await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
-
-          const detail = await scpFetch('product', { id: best.id })
-          if (detail.status === 'success') {
-            return res.json({
-              status: 'success',
-              query: q,
-              matchedProduct: detail['product-name'],
-              matchedSet: detail['console-name'],
-              productId: detail.id,
-              raw: centsToDollars(detail['loose-price']),
-              psa8: centsToDollars(detail['new-price']),
-              psa9: centsToDollars(detail['graded-price']),
-              psa10: centsToDollars(detail['manual-only-price']),
-              bgs10: centsToDollars(detail['bgs-10-price']),
-              cgc10: centsToDollars(detail['condition-17-price']),
-              sgc10: centsToDollars(detail['condition-18-price']),
-              salesVolume: detail['sales-volume'] ?? null,
-              source: 'SportsCardsPro'
-            })
+          // Card-number-aware ranking (hyphen-normalized) — number-matching entries first, then alternates.
+          let ranked = pool
+          if (cardNumStr) {
+            const num = norm(cardNumStr)
+            const withNum = pool.filter(p => norm(p['product-name'] || '').includes(num))
+            const withoutNum = pool.filter(p => !norm(p['product-name'] || '').includes(num))
+            if (withNum.length) ranked = [...withNum, ...withoutNum]
+          }
+          const candidates = ranked.slice(0, 3)
+          const results = []
+          for (const c of candidates) {
+            await new Promise(r => setTimeout(r, 1100))
+            const detail = await scpFetch('product', { id: c.id })
+            if (detail.status === 'success') {
+              results.push({
+                matchedProduct: detail['product-name'],
+                matchedSet: detail['console-name'],
+                productId: detail.id,
+                raw: centsToDollars(detail['loose-price']),
+                psa8: centsToDollars(detail['new-price']),
+                psa9: centsToDollars(detail['graded-price']),
+                psa10: centsToDollars(detail['manual-only-price']),
+                bgs10: centsToDollars(detail['bgs-10-price']),
+                cgc10: centsToDollars(detail['condition-17-price']),
+                sgc10: centsToDollars(detail['condition-18-price']),
+                salesVolume: detail['sales-volume'] ?? null,
+              })
+            }
+          }
+          if (results.length) {
+            const [top, ...alternates] = results
+            return res.json({ status: 'success', query: q, ...top, alternates })
           }
         }
       }
-
-      await new Promise(r => setTimeout(r, 1100)) // pace next attempt within SCP rate limit
+      await new Promise(r => setTimeout(r, 1100))
     }
-
-    return res.json({ status: 'not_found', query: lastQuery })
-  } catch (err) { res.status(500).json({ error: err.message }) }
+    res.json({ status: 'no_match', query: lastQuery })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
 })
 
-// ── ONE-TIME BULK BACKFILL: re-pull every card's comps via SportsCardsPro ─────────────────
-// So old (eBay-sourced) and new comps are consistent platform-wide. Fire-and-forget background job —
-// responds immediately with a count, then processes sequentially respecting SCP's rate limit.
 app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
   try {
     // NOTE: actual Supabase column names are player/brand/parallel/card_num (not the
@@ -879,7 +894,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.7.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.8.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
