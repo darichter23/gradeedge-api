@@ -193,6 +193,7 @@ async function fetchTiersFromSCP(card) {
   const playerName = card.player_name || ''
   const yearStr = card.year || ''
   const cardNumStr = card.card_number ? '#' + String(card.card_number).replace(/^#/, '') : ''
+  const lastName = playerName.trim().split(/\s+/).pop() || ''
 
   // Try progressively broader queries so an unusual brand/parallel wording or a card-number
   // format mismatch doesn't zero out comps that genuinely exist on SportsCardsPro.
@@ -212,31 +213,40 @@ async function fetchTiersFromSCP(card) {
 
     const search = await scpFetch('products', { q })
     if (search.status === 'success' && search.products?.length) {
-      let best = search.products[0]
-      if (cardNumStr) {
-        const num = cardNumStr.replace('#', '')
-        const withNum = search.products.find(p => String(p['product-name'] || '').includes(num))
-        if (withNum) best = withNum
-      }
+      // Guard against SCP's search returning an unrelated player's card for a shared insert
+      // set/card-number — require the player's last name to actually appear in the product.
+      const nameMatches = lastName
+        ? search.products.filter(p => String(p['product-name'] || '').toLowerCase().includes(lastName.toLowerCase()))
+        : search.products
+      const pool = nameMatches.length ? nameMatches : (lastName ? [] : search.products)
 
-      await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+      if (pool.length) {
+        let best = pool[0]
+        if (cardNumStr) {
+          const num = cardNumStr.replace('#', '')
+          const withNum = pool.find(p => String(p['product-name'] || '').includes(num))
+          if (withNum) best = withNum
+        }
 
-      const detail = await scpFetch('product', { id: best.id })
-      if (detail.status === 'success') {
-        return {
-          matched: true,
-          query: q,
-          matchedProduct: detail['product-name'],
-          matchedSet: detail['console-name'],
-          productId: detail.id,
-          raw: centsToDollars(detail['loose-price']),
-          psa8: centsToDollars(detail['new-price']),
-          psa9: centsToDollars(detail['graded-price']),
-          psa10: centsToDollars(detail['manual-only-price']),
-          bgs10: centsToDollars(detail['bgs-10-price']),
-          cgc10: centsToDollars(detail['condition-17-price']),
-          sgc10: centsToDollars(detail['condition-18-price']),
-          salesVolume: detail['sales-volume'] ?? null,
+        await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+
+        const detail = await scpFetch('product', { id: best.id })
+        if (detail.status === 'success') {
+          return {
+            matched: true,
+            query: q,
+            matchedProduct: detail['product-name'],
+            matchedSet: detail['console-name'],
+            productId: detail.id,
+            raw: centsToDollars(detail['loose-price']),
+            psa8: centsToDollars(detail['new-price']),
+            psa9: centsToDollars(detail['graded-price']),
+            psa10: centsToDollars(detail['manual-only-price']),
+            bgs10: centsToDollars(detail['bgs-10-price']),
+            cgc10: centsToDollars(detail['condition-17-price']),
+            sgc10: centsToDollars(detail['condition-18-price']),
+            salesVolume: detail['sales-volume'] ?? null,
+          }
         }
       }
     }
@@ -355,7 +365,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.5.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.6.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -645,6 +655,7 @@ app.get('/api/comps/multigrade', async (req, res) => {
     if (!player) return res.status(400).json({ error: 'player is required' })
     const brandFull = brand ? brand.trim().replace(/\s+/g, ' ') : ''
     const cardNumStr = cardNum ? '#' + String(cardNum).replace(/^#/, '') : ''
+    const lastName = player.trim().split(/\s+/).pop() || ''
 
     // Try progressively broader queries so an unusual brand/parallel wording or a card-number
     // format mismatch doesn't zero out comps that genuinely exist on SportsCardsPro.
@@ -664,33 +675,42 @@ app.get('/api/comps/multigrade', async (req, res) => {
 
       const search = await scpFetch('products', { q })
       if (search.status === 'success' && search.products?.length) {
-        let best = search.products[0]
-        if (cardNumStr) {
-          const num = cardNumStr.replace('#', '')
-          const withNum = search.products.find(p => String(p['product-name'] || '').includes(num))
-          if (withNum) best = withNum
-        }
+        // Guard against SCP's search returning an unrelated player's card for a shared insert
+        // set/card-number — require the player's last name to actually appear in the product.
+        const nameMatches = lastName
+          ? search.products.filter(p => String(p['product-name'] || '').toLowerCase().includes(lastName.toLowerCase()))
+          : search.products
+        const pool = nameMatches.length ? nameMatches : (lastName ? [] : search.products)
 
-        await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+        if (pool.length) {
+          let best = pool[0]
+          if (cardNumStr) {
+            const num = cardNumStr.replace('#', '')
+            const withNum = pool.find(p => String(p['product-name'] || '').includes(num))
+            if (withNum) best = withNum
+          }
 
-        const detail = await scpFetch('product', { id: best.id })
-        if (detail.status === 'success') {
-          return res.json({
-            status: 'success',
-            query: q,
-            matchedProduct: detail['product-name'],
-            matchedSet: detail['console-name'],
-            productId: detail.id,
-            raw: centsToDollars(detail['loose-price']),
-            psa8: centsToDollars(detail['new-price']),
-            psa9: centsToDollars(detail['graded-price']),
-            psa10: centsToDollars(detail['manual-only-price']),
-            bgs10: centsToDollars(detail['bgs-10-price']),
-            cgc10: centsToDollars(detail['condition-17-price']),
-            sgc10: centsToDollars(detail['condition-18-price']),
-            salesVolume: detail['sales-volume'] ?? null,
-            source: 'SportsCardsPro'
-          })
+          await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+
+          const detail = await scpFetch('product', { id: best.id })
+          if (detail.status === 'success') {
+            return res.json({
+              status: 'success',
+              query: q,
+              matchedProduct: detail['product-name'],
+              matchedSet: detail['console-name'],
+              productId: detail.id,
+              raw: centsToDollars(detail['loose-price']),
+              psa8: centsToDollars(detail['new-price']),
+              psa9: centsToDollars(detail['graded-price']),
+              psa10: centsToDollars(detail['manual-only-price']),
+              bgs10: centsToDollars(detail['bgs-10-price']),
+              cgc10: centsToDollars(detail['condition-17-price']),
+              sgc10: centsToDollars(detail['condition-18-price']),
+              salesVolume: detail['sales-volume'] ?? null,
+              source: 'SportsCardsPro'
+            })
+          }
         }
       }
 
@@ -857,7 +877,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.5.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.6.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
