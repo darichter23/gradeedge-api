@@ -174,6 +174,18 @@ async function scpFetch(path, params) {
 }
 const centsToDollars = v => (v == null ? null : Math.round(v) / 100)
 
+// Best-effort extraction of a player name from an SCP product title. SCP's console-name field
+// already carries the year/brand/set (e.g. "2024 Panini Prizm"), so product-name is typically just
+// the player plus a card number and/or bracketed parallel — strip those and what's left is the name.
+function extractPlayerNameFromProduct(productName) {
+  if (!productName) return ''
+  return productName
+    .replace(/#\S+/g, '')
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
 // Look up a single card's full multi-grade comp set from SportsCardsPro.
 // Two sequential API calls (search then detail) — internally paced to respect SCP's 1 req/sec limit.
 async function fetchTiersFromSCP(card) {
@@ -320,7 +332,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.0.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.2.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -455,6 +467,81 @@ app.post('/api/comps/approve', async (req, res) => {
     console.error('[Comps] Approve error:', err.message)
     res.status(500).json({ error: 'Failed to save comps', detail: err.message })
   }
+})
+
+// ── Buying Sector: live eBay listing alerts for watchlist players ──────────
+// Unlike the SportsCardsPro-based comp pipeline above (sold prices, for valuing what you own),
+// this deliberately searches eBay's Browse API for CURRENT ACTIVE listings — because a buy alert
+// is about "what can I buy right now," which is exactly what active listings show. Excludes graded
+// listings (buildRawQuery appends -PSA -BGS -SGC -CGC -graded) since Buying Sector is for sourcing
+// raw cards to grade. A listing is flagged as a "good buy" if its price is at/below the user's
+// target price, or — if no target is set — at least 15% below the current SportsCardsPro raw comp.
+// Player-name autocomplete for the Buying Sector "Player Name" field. No standalone athlete
+// database exists here, so this searches SportsCardsPro's card catalog for the partial query and
+// dedupes the player names found in matching card titles — coverage follows whatever players SCP
+// has cards for, which is effectively every notable athlete across the sports/TCG categories it sells.
+app.get('/api/players/search', async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim()
+    if (q.length < 2) return res.json({ players: [] })
+    const search = await scpFetch('products', { q })
+    if (search.status !== 'success' || !search.products?.length) return res.json({ players: [] })
+    const seen = new Map()
+    for (const p of search.products) {
+      const name = extractPlayerNameFromProduct(p['product-name'])
+      if (!name) continue
+      const key = name.toLowerCase()
+      if (!seen.has(key)) seen.set(key, { player: name, set: p['console-name'] || '' })
+    }
+    res.json({ players: Array.from(seen.values()).slice(0, 10) })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+app.post('/api/watchlist/alerts', async (req, res) => {
+  try {
+    const { items } = req.body
+    if (!items || !Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items array required' })
+
+    const results = []
+    for (const item of items.slice(0, 25)) {
+      try {
+        const query = buildRawQuery(item.player_name, null, null, null)
+        const rawItems = await fetchItems(query, 30)
+        const listings = parseItems(rawItems)
+
+        let benchmark = null, benchmarkSource = null
+        if (item.target_price) {
+          benchmark = Number(item.target_price)
+          benchmarkSource = 'target price'
+        } else {
+          try {
+            const scp = await fetchTiersFromSCP({ player_name: item.player_name, brand_parallel: '', card_number: '', year: '' })
+            if (scp.matched && scp.raw) { benchmark = scp.raw; benchmarkSource = 'market comp' }
+          } catch (e) { /* no SCP match — fall back to unranked listings below */ }
+        }
+        const threshold = benchmarkSource === 'target price' ? benchmark : (benchmark ? benchmark * 0.85 : null)
+
+        const sorted = [...listings].sort((a, b) => a.price - b.price)
+        const goodBuys = threshold != null ? sorted.filter(l => l.price <= threshold) : []
+        const flagged = threshold != null ? goodBuys.slice(0, 8) : sorted.slice(0, 5)
+
+        results.push({
+          id: item.id,
+          player: item.player_name,
+          query,
+          benchmark, benchmarkSource, threshold,
+          totalListings: listings.length,
+          goodBuyCount: goodBuys.length,
+          listings: flagged,
+        })
+        await new Promise(r => setTimeout(r, 250))
+      } catch (e) {
+        console.error(`[WatchlistAlerts] ${item.player_name}:`, e.message)
+        results.push({ id: item.id, player: item.player_name, error: e.message, listings: [] })
+      }
+    }
+    res.json({ results, checkedAt: new Date().toISOString() })
+  } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
 // ── AI Card Scanner ─────────────────────────────────────────────────────────
@@ -705,7 +792,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.0.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.2.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
