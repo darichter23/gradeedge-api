@@ -253,9 +253,74 @@ function find30dAgoValue(history, tierKey) {
   return best
 }
 
+// ── Sell / Watch / Hold signal engine ───────────────────────────────────────
+// Design goal (per owner): fire GREEN only when there's real, confirmed upward momentum AND
+// the card would net a genuinely profitable sale after marketplace fees/shipping — not just
+// "price ticked up." Fire RED when trending down or when selling today would net a loss.
+// Everything else (including "not enough data yet") is YELLOW/GRAY so the signal never guesses.
+//
+// Timeframes are anchored to the weekly comp-refresh cadence (Sundays 2 AM Mountain), since that's
+// the finest granularity the data supports:
+//   short window  = most recent ~2 weekly snapshots + today  (~7–14 days)  → catches active momentum/spikes
+//   medium window = the 4 snapshots before that                (~30–45 days) → baseline to compare against
+// A card needs at least 3 weekly snapshots of real price history before the signal will commit to
+// green or red — before that it shows gray ("gathering data") rather than reacting to a single noisy point.
+const SIGNAL_FEE_RATE = 0.135   // ~eBay final value fee + payment processing, as a fraction of sale price
+const SIGNAL_SHIP_EST = 5       // flat estimated shipping/supplies cost per card, dollars
+const SIGNAL_MOMENTUM_UP = 8    // % above baseline to count as "trending up"
+const SIGNAL_MOMENTUM_DOWN = -8 // % below baseline to count as "trending down"
+const SIGNAL_MIN_MARGIN = 15    // minimum net margin % required to call it GREEN
+
+function computeSellSignal(card) {
+  const history = Array.isArray(card.comp_history) ? card.comp_history : []
+  const tierKey = tierKeyForCard(card)
+  const withVals = history.filter(h => h[tierKey] != null).map(h => Number(h[tierKey]))
+  const todayVal = card.comp_today != null ? Number(card.comp_today) : (withVals.length ? withVals[withVals.length - 1] : null)
+
+  if (withVals.length < 3 || todayVal == null) {
+    return { color: 'gray', momentum_pct: null, net_margin_pct: null, reason: 'Gathering price history — need 3+ weekly comp pulls before this signal is reliable' }
+  }
+
+  const recentPoints = [...withVals.slice(-2), todayVal]
+  const shortAvg = recentPoints.reduce((a, b) => a + b, 0) / recentPoints.length
+  const priorPoints = withVals.slice(-6, -2)
+  const baselinePoints = priorPoints.length ? priorPoints : withVals.slice(0, -2)
+  const mediumAvg = baselinePoints.length ? baselinePoints.reduce((a, b) => a + b, 0) / baselinePoints.length : shortAvg
+  const momentumPct = mediumAvg > 0 ? ((shortAvg - mediumAvg) / mediumAvg) * 100 : 0
+
+  const allInCost = card.all_in_cost != null ? Number(card.all_in_cost) : null
+  let netMarginPct = null
+  if (allInCost && allInCost > 0) {
+    const netProceeds = todayVal * (1 - SIGNAL_FEE_RATE) - SIGNAL_SHIP_EST
+    netMarginPct = ((netProceeds - allInCost) / allInCost) * 100
+  }
+
+  const roundedMomentum = Math.round(momentumPct * 10) / 10
+  const roundedMargin = netMarginPct != null ? Math.round(netMarginPct * 10) / 10 : null
+
+  let color = 'yellow', reason = 'Stable — price within normal range of baseline'
+  if (netMarginPct != null && netMarginPct < 0) {
+    color = 'red'
+    reason = `Would net a loss after fees/shipping (${roundedMargin}%) — hold`
+  } else if (momentumPct <= SIGNAL_MOMENTUM_DOWN) {
+    color = 'red'
+    reason = `Price trending down ${Math.abs(roundedMomentum)}% vs recent baseline — don't list into a falling market`
+  } else if (momentumPct >= SIGNAL_MOMENTUM_UP && netMarginPct != null && netMarginPct >= SIGNAL_MIN_MARGIN) {
+    color = 'green'
+    reason = `Price up ${roundedMomentum}% vs baseline with ${roundedMargin}% net margin — good time to sell`
+  } else if (momentumPct >= SIGNAL_MOMENTUM_UP) {
+    color = 'yellow'
+    reason = allInCost
+      ? `Price trending up ${roundedMomentum}% but net margin (${roundedMargin}%) is below the ${SIGNAL_MIN_MARGIN}% target — watch`
+      : `Price trending up ${roundedMomentum}% — set a cost basis on this card to unlock margin-based sell alerts`
+  }
+
+  return { color, momentum_pct: roundedMomentum, net_margin_pct: roundedMargin, reason }
+}
+
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '7.0.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.0.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -367,12 +432,13 @@ app.post('/api/comps/approve', async (req, res) => {
   if (!cardId) return res.status(400).json({ error: 'cardId required' })
   try {
     const now = new Date().toISOString()
-    const { data: existing } = await supabase.from('cards').select('grade, comp_today, comp_30d, comp_history').eq('id', cardId).single()
+    const { data: existing } = await supabase.from('cards').select('grade, all_in_cost, comp_today, comp_30d, comp_history').eq('id', cardId).single()
     const prevHistory = existing?.comp_history || []
     const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null, source: 'SportsCardsPro' }].slice(-52)
     const tierKey = tierKeyForCard({ grade: existing?.grade })
     const todayComp = pickTodayComp({ matched: true, raw, psa9, psa10 }, tierKey)
     const comp30 = find30dAgoValue(prevHistory, tierKey) ?? existing?.comp_30d ?? null
+    const signal = computeSellSignal({ grade: existing?.grade, all_in_cost: existing?.all_in_cost, comp_today: todayComp ?? existing?.comp_today, comp_history: updatedHistory })
     const { error } = await supabase.from('cards').update({
       comp_raw: raw ?? null, comp_psa9: psa9 ?? null, comp_psa10: psa10 ?? null,
       comp_today: todayComp ?? existing?.comp_today ?? null,
@@ -380,9 +446,11 @@ app.post('/api/comps/approve', async (req, res) => {
       comp_source: 'SportsCardsPro',
       comp_auto_refresh: autoRefresh ?? false,
       comp_last_refreshed: now, comp_history: updatedHistory,
+      signal_color: signal.color, signal_momentum_pct: signal.momentum_pct,
+      signal_net_margin_pct: signal.net_margin_pct, signal_reason: signal.reason, signal_updated_at: now,
     }).eq('id', cardId)
     if (error) throw error
-    res.json({ success: true, lastRefreshed: now })
+    res.json({ success: true, lastRefreshed: now, signal })
   } catch (err) {
     console.error('[Comps] Approve error:', err.message)
     res.status(500).json({ error: 'Failed to save comps', detail: err.message })
@@ -490,7 +558,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
     // player_name/brand_parallel/card_number naming used internally by fetchTiersFromSCP) —
     // map them here rather than selecting nonexistent columns.
     const { data: rows, error } = await supabase.from('cards')
-      .select('id, player, brand, parallel, card_num, year, numbered, grade, comp_today, comp_30d, comp_history')
+      .select('id, player, brand, parallel, card_num, year, numbered, grade, all_in_cost, comp_today, comp_30d, comp_history')
     if (error) throw error
     const cards = rows.map(row => ({
       id: row.id,
@@ -500,6 +568,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
       year: row.year,
       numbered: row.numbered,
       grade: row.grade,
+      all_in_cost: row.all_in_cost,
       comp_today: row.comp_today,
       comp_30d: row.comp_30d,
       comp_history: row.comp_history,
@@ -520,13 +589,16 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
             const todayComp = pickTodayComp(scp, tierKey)
             const comp30 = find30dAgoValue(card.comp_history || [], tierKey) ?? card.comp_30d ?? null
             const history = [...(card.comp_history || []), { date: now, raw: scp.raw, psa9: scp.psa9, psa10: scp.psa10, source: 'SportsCardsPro' }].slice(-52)
+            const signal = computeSellSignal({ grade: card.grade, all_in_cost: card.all_in_cost, comp_today: todayComp ?? card.comp_today, comp_history: history })
             await supabase.from('cards').update({
               comp_raw: scp.raw, comp_psa9: scp.psa9, comp_psa10: scp.psa10,
               comp_today: todayComp ?? card.comp_today ?? null, comp_30d: comp30,
               comp_source: 'SportsCardsPro', comp_last_refreshed: now, comp_history: history,
+              signal_color: signal.color, signal_momentum_pct: signal.momentum_pct,
+              signal_net_margin_pct: signal.net_margin_pct, signal_reason: signal.reason, signal_updated_at: now,
             }).eq('id', card.id)
             ok++
-            console.log(`[BulkSCP] ✅ ${card.player_name} raw=${scp.raw} psa9=${scp.psa9} psa10=${scp.psa10} today(${tierKey})=${todayComp} 30d=${comp30}`)
+            console.log(`[BulkSCP] ✅ ${card.player_name} raw=${scp.raw} psa9=${scp.psa9} psa10=${scp.psa10} today(${tierKey})=${todayComp} 30d=${comp30} signal=${signal.color}`)
           }
         } catch (e) {
           fail++
@@ -535,6 +607,35 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
         await new Promise(r => setTimeout(r, 1100))
       }
       console.log(`[BulkSCP] Backfill complete — ok:${ok} notFound:${notFound} fail:${fail}`)
+    })()
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// ── ONE-TIME (and re-runnable) SIGNAL RECOMPUTE: recalculate signal_color for every card ──────
+// from data already stored in Supabase (comp_today, comp_history, all_in_cost) — no external API
+// calls, so it runs fast with no rate-limit wait. Use this after deploying a new signal algorithm
+// version, or any time thresholds change, to re-grade all cards without re-pulling comps.
+app.post('/api/signal/recompute-all', async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase.from('cards')
+      .select('id, grade, all_in_cost, comp_today, comp_history')
+    if (error) throw error
+    res.json({ started: true, totalCards: rows.length })
+
+    ;(async () => {
+      let updated = 0, fail = 0
+      const now = new Date().toISOString()
+      for (const row of rows) {
+        try {
+          const signal = computeSellSignal(row)
+          await supabase.from('cards').update({
+            signal_color: signal.color, signal_momentum_pct: signal.momentum_pct,
+            signal_net_margin_pct: signal.net_margin_pct, signal_reason: signal.reason, signal_updated_at: now,
+          }).eq('id', row.id)
+          updated++
+        } catch (e) { fail++; console.error(`[SignalRecompute] ❌ ${row.id}:`, e.message) }
+      }
+      console.log(`[SignalRecompute] Done — updated:${updated} fail:${fail}`)
     })()
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -548,7 +649,7 @@ cron.schedule('0 2 * * 0', async () => {
     // referenced player_name/brand_parallel/card_number, which don't exist on the table, so this
     // cron has been throwing (and silently doing nothing) on every scheduled run. Fixed here.
     const { data: rows } = await supabase.from('cards')
-      .select('id, player, brand, parallel, card_num, year, numbered, grade, comp_raw, comp_psa9, comp_psa10, comp_today, comp_30d, comp_history')
+      .select('id, player, brand, parallel, card_num, year, numbered, grade, all_in_cost, comp_raw, comp_psa9, comp_psa10, comp_today, comp_30d, comp_history')
       .eq('comp_auto_refresh', true)
     if (!rows || rows.length === 0) return console.log('[CronRefresh] No cards to refresh')
     const cards = rows.map(row => ({
@@ -559,6 +660,7 @@ cron.schedule('0 2 * * 0', async () => {
       year: row.year,
       numbered: row.numbered,
       grade: row.grade,
+      all_in_cost: row.all_in_cost,
       comp_raw: row.comp_raw,
       comp_psa9: row.comp_psa9,
       comp_psa10: row.comp_psa10,
@@ -581,6 +683,7 @@ cron.schedule('0 2 * * 0', async () => {
         const todayComp = pickTodayComp(scpFlat, tierKey)
         const comp30 = find30dAgoValue(card.comp_history || [], tierKey) ?? card.comp_30d ?? null
         const history = [...(card.comp_history || []), { date: now, raw: scpFlat.raw, psa9: scpFlat.psa9, psa10: scpFlat.psa10, source: 'SportsCardsPro' }].slice(-52)
+        const signal = computeSellSignal({ grade: card.grade, all_in_cost: card.all_in_cost, comp_today: todayComp ?? card.comp_today, comp_history: history })
         await supabase.from('cards').update({
           comp_raw: scpFlat.raw ?? card.comp_raw,
           comp_psa9: scpFlat.psa9 ?? card.comp_psa9,
@@ -589,9 +692,11 @@ cron.schedule('0 2 * * 0', async () => {
           comp_30d: comp30,
           comp_source: 'SportsCardsPro',
           comp_last_refreshed: now,
-          comp_history: history
+          comp_history: history,
+          signal_color: signal.color, signal_momentum_pct: signal.momentum_pct,
+          signal_net_margin_pct: signal.net_margin_pct, signal_reason: signal.reason, signal_updated_at: now,
         }).eq('id', card.id)
-        console.log(`[CronRefresh] ✅ ${card.player_name} today(${tierKey})=${todayComp} 30d=${comp30}`)
+        console.log(`[CronRefresh] ✅ ${card.player_name} today(${tierKey})=${todayComp} 30d=${comp30} signal=${signal.color}`)
         await new Promise(r => setTimeout(r, 2200))
       } catch (e) { console.error(`[CronRefresh] ❌ ${card.id}:`, e.message) }
     }
@@ -600,8 +705,9 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v7.0.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.0.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
+  console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
   console.log('eBay Client ID configured (legacy /api/comps + /api/comps/bulk only):', !!process.env.EBAY_CLIENT_ID)
   console.log('Anthropic configured:', !!process.env.ANTHROPIC_API_KEY)
