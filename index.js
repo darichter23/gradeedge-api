@@ -332,7 +332,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.2.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.3.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -523,7 +523,7 @@ app.post('/api/watchlist/alerts', async (req, res) => {
 
         const sorted = [...listings].sort((a, b) => a.price - b.price)
         const goodBuys = threshold != null ? sorted.filter(l => l.price <= threshold) : []
-        const flagged = threshold != null ? goodBuys.slice(0, 8) : sorted.slice(0, 5)
+        const flagged = goodBuys.length > 0 ? goodBuys.slice(0, 8) : sorted.slice(0, 5)
 
         results.push({
           id: item.id,
@@ -792,7 +792,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.2.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.3.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
