@@ -332,7 +332,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.3.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.4.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -486,12 +486,21 @@ app.get('/api/players/search', async (req, res) => {
     if (q.length < 2) return res.json({ players: [] })
     const search = await scpFetch('products', { q })
     if (search.status !== 'success' || !search.products?.length) return res.json({ players: [] })
+    const qLower = q.toLowerCase()
     const seen = new Map()
     for (const p of search.products) {
-      const name = extractPlayerNameFromProduct(p['product-name'])
-      if (!name) continue
-      const key = name.toLowerCase()
-      if (!seen.has(key)) seen.set(key, { player: name, set: p['console-name'] || '' })
+      const raw = extractPlayerNameFromProduct(p['product-name'])
+      if (!raw) continue
+      const consoleName = p['console-name'] || ''
+      const sportMatch = consoleName.match(/^([A-Za-z]+)\s+Cards/)
+      const sport = sportMatch ? sportMatch[1] : ''
+      const parts = raw.split('/').map(s => s.trim()).filter(Boolean)
+      const matched = parts.length > 1 ? parts.filter(part => part.toLowerCase().includes(qLower)) : [raw]
+      const names = matched.length ? matched : parts
+      for (const name of names) {
+        const key = name.toLowerCase()
+        if (!seen.has(key)) seen.set(key, { player: name, sport })
+      }
     }
     res.json({ players: Array.from(seen.values()).slice(0, 10) })
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -792,7 +801,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.3.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.4.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
