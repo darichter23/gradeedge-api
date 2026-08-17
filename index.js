@@ -223,8 +223,9 @@ async function fetchTiersFromSCP(card) {
       if (pool.length) {
         let best = pool[0]
         if (cardNumStr) {
-          const num = cardNumStr.replace('#', '')
-          const withNum = pool.find(p => String(p['product-name'] || '').includes(num))
+          const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+          const num = norm(cardNumStr)
+          const withNum = pool.find(p => norm(p['product-name'] || '').includes(num))
           if (withNum) best = withNum
         }
 
@@ -365,7 +366,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.6.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.7.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -685,8 +686,9 @@ app.get('/api/comps/multigrade', async (req, res) => {
         if (pool.length) {
           let best = pool[0]
           if (cardNumStr) {
-            const num = cardNumStr.replace('#', '')
-            const withNum = pool.find(p => String(p['product-name'] || '').includes(num))
+            const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+            const num = norm(cardNumStr)
+            const withNum = pool.find(p => norm(p['product-name'] || '').includes(num))
             if (withNum) best = withNum
           }
 
@@ -877,7 +879,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.6.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.7.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
