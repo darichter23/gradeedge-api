@@ -189,39 +189,62 @@ function extractPlayerNameFromProduct(productName) {
 // Look up a single card's full multi-grade comp set from SportsCardsPro.
 // Two sequential API calls (search then detail) — internally paced to respect SCP's 1 req/sec limit.
 async function fetchTiersFromSCP(card) {
-  const words = card.brand_parallel ? String(card.brand_parallel).trim().split(/\s+/).slice(0, 2).join(' ') : ''
-  const q = [
-    card.year,
-    words,
-    card.player_name,
-    card.card_number ? '#' + String(card.card_number).replace(/^#/, '') : ''
-  ].filter(Boolean).join(' ').trim()
+  const brandFull = card.brand_parallel ? String(card.brand_parallel).trim().replace(/\s+/g, ' ') : ''
+  const playerName = card.player_name || ''
+  const yearStr = card.year || ''
+  const cardNumStr = card.card_number ? '#' + String(card.card_number).replace(/^#/, '') : ''
 
-  if (!q) return { matched: false, query: q }
+  // Try progressively broader queries so an unusual brand/parallel wording or a card-number
+  // format mismatch doesn't zero out comps that genuinely exist on SportsCardsPro.
+  const attemptParts = [
+    [yearStr, brandFull, playerName, cardNumStr],
+    [yearStr, brandFull, playerName],
+    [yearStr, playerName],
+  ]
 
-  const search = await scpFetch('products', { q })
-  if (search.status !== 'success' || !search.products?.length) return { matched: false, query: q }
+  const seen = new Set()
+  let lastQuery = ''
+  for (const parts of attemptParts) {
+    const q = parts.filter(Boolean).join(' ').trim()
+    if (!q || seen.has(q)) continue
+    seen.add(q)
+    lastQuery = q
 
-  await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+    const search = await scpFetch('products', { q })
+    if (search.status === 'success' && search.products?.length) {
+      let best = search.products[0]
+      if (cardNumStr) {
+        const num = cardNumStr.replace('#', '')
+        const withNum = search.products.find(p => String(p['product-name'] || '').includes(num))
+        if (withNum) best = withNum
+      }
 
-  const detail = await scpFetch('product', { id: search.products[0].id })
-  if (detail.status !== 'success') return { matched: false, query: q }
+      await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
 
-  return {
-    matched: true,
-    query: q,
-    matchedProduct: detail['product-name'],
-    matchedSet: detail['console-name'],
-    productId: detail.id,
-    raw: centsToDollars(detail['loose-price']),
-    psa8: centsToDollars(detail['new-price']),
-    psa9: centsToDollars(detail['graded-price']),
-    psa10: centsToDollars(detail['manual-only-price']),
-    bgs10: centsToDollars(detail['bgs-10-price']),
-    cgc10: centsToDollars(detail['condition-17-price']),
-    sgc10: centsToDollars(detail['condition-18-price']),
-    salesVolume: detail['sales-volume'] ?? null,
+      const detail = await scpFetch('product', { id: best.id })
+      if (detail.status === 'success') {
+        return {
+          matched: true,
+          query: q,
+          matchedProduct: detail['product-name'],
+          matchedSet: detail['console-name'],
+          productId: detail.id,
+          raw: centsToDollars(detail['loose-price']),
+          psa8: centsToDollars(detail['new-price']),
+          psa9: centsToDollars(detail['graded-price']),
+          psa10: centsToDollars(detail['manual-only-price']),
+          bgs10: centsToDollars(detail['bgs-10-price']),
+          cgc10: centsToDollars(detail['condition-17-price']),
+          sgc10: centsToDollars(detail['condition-18-price']),
+          salesVolume: detail['sales-volume'] ?? null,
+        }
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 1100)) // pace next attempt within SCP rate limit
   }
+
+  return { matched: false, query: lastQuery }
 }
 
 // Build a sparkline-compatible weekly trend from our own stored comp_history snapshots.
@@ -332,7 +355,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.4.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.5.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -620,28 +643,61 @@ app.get('/api/comps/multigrade', async (req, res) => {
   try {
     const { player, year, brand, cardNum } = req.query
     if (!player) return res.status(400).json({ error: 'player is required' })
-    const words = brand ? brand.trim().split(/\s+/).slice(0, 2).join(' ') : ''
-    const q = [year, words, player.trim(), cardNum ? '#' + String(cardNum).replace(/^#/, '') : ''].filter(Boolean).join(' ')
-    const search = await scpFetch('products', { q })
-    if (search.status !== 'success' || !search.products?.length) return res.json({ status: 'not_found', query: q })
-    const detail = await scpFetch('product', { id: search.products[0].id })
-    if (detail.status !== 'success') return res.json({ status: 'not_found', query: q })
-    res.json({
-      status: 'success',
-      query: q,
-      matchedProduct: detail['product-name'],
-      matchedSet: detail['console-name'],
-      productId: detail.id,
-      raw: centsToDollars(detail['loose-price']),
-      psa8: centsToDollars(detail['new-price']),
-      psa9: centsToDollars(detail['graded-price']),
-      psa10: centsToDollars(detail['manual-only-price']),
-      bgs10: centsToDollars(detail['bgs-10-price']),
-      cgc10: centsToDollars(detail['condition-17-price']),
-      sgc10: centsToDollars(detail['condition-18-price']),
-      salesVolume: detail['sales-volume'] ?? null,
-      source: 'SportsCardsPro'
-    })
+    const brandFull = brand ? brand.trim().replace(/\s+/g, ' ') : ''
+    const cardNumStr = cardNum ? '#' + String(cardNum).replace(/^#/, '') : ''
+
+    // Try progressively broader queries so an unusual brand/parallel wording or a card-number
+    // format mismatch doesn't zero out comps that genuinely exist on SportsCardsPro.
+    const attemptParts = [
+      [year, brandFull, player.trim(), cardNumStr],
+      [year, brandFull, player.trim()],
+      [year, player.trim()],
+    ]
+
+    const seen = new Set()
+    let lastQuery = ''
+    for (const parts of attemptParts) {
+      const q = parts.filter(Boolean).join(' ').trim()
+      if (!q || seen.has(q)) continue
+      seen.add(q)
+      lastQuery = q
+
+      const search = await scpFetch('products', { q })
+      if (search.status === 'success' && search.products?.length) {
+        let best = search.products[0]
+        if (cardNumStr) {
+          const num = cardNumStr.replace('#', '')
+          const withNum = search.products.find(p => String(p['product-name'] || '').includes(num))
+          if (withNum) best = withNum
+        }
+
+        await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+
+        const detail = await scpFetch('product', { id: best.id })
+        if (detail.status === 'success') {
+          return res.json({
+            status: 'success',
+            query: q,
+            matchedProduct: detail['product-name'],
+            matchedSet: detail['console-name'],
+            productId: detail.id,
+            raw: centsToDollars(detail['loose-price']),
+            psa8: centsToDollars(detail['new-price']),
+            psa9: centsToDollars(detail['graded-price']),
+            psa10: centsToDollars(detail['manual-only-price']),
+            bgs10: centsToDollars(detail['bgs-10-price']),
+            cgc10: centsToDollars(detail['condition-17-price']),
+            sgc10: centsToDollars(detail['condition-18-price']),
+            salesVolume: detail['sales-volume'] ?? null,
+            source: 'SportsCardsPro'
+          })
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 1100)) // pace next attempt within SCP rate limit
+    }
+
+    return res.json({ status: 'not_found', query: lastQuery })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
@@ -801,7 +857,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.4.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.5.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
