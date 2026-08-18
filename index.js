@@ -221,15 +221,29 @@ async function fetchTiersFromSCP(card) {
       const pool = nameMatches.length ? nameMatches : (lastName ? [] : search.products)
 
       if (pool.length) {
-        let best = pool[0]
-        if (cardNumStr) {
-          const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
-          const num = norm(cardNumStr)
-          const withNum = pool.find(p => norm(p['product-name'] || '').includes(num))
-          if (withNum) best = withNum
-        }
+let best = pool[0]
+const isParallelProduct = name => /\[[^\]]+\]/.test(String(name || ''))
+const brandLower = brandFull.toLowerCase()
+const withMatchingParallel = pool.filter(p => {
+const m = String(p['product-name'] || '').match(/\[([^\]]+)\]/)
+return m && brandLower.includes(m[1].toLowerCase())
+})
+if (withMatchingParallel.length) {
+best = withMatchingParallel[0]
+} else {
+const base = pool.filter(p => !isParallelProduct(p['product-name']))
+if (base.length) best = base[0]
+}
+if (cardNumStr) {
+const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
+const num = norm(cardNumStr)
+const noParallelPool = pool.filter(p => !isParallelProduct(p['product-name']))
+const candidatePool = withMatchingParallel.length ? withMatchingParallel : (noParallelPool.length ? noParallelPool : pool)
+const withNum = candidatePool.find(p => norm(p['product-name'] || '').includes(num))
+if (withNum) best = withNum
+}
 
-        await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
+await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between the two calls
 
         const detail = await scpFetch('product', { id: best.id })
         if (detail.status === 'success') {
@@ -366,7 +380,7 @@ function computeSellSignal(card) {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'GradeEdge API running', version: '8.8.0' })
+  res.json({ status: 'GradeEdge API running', version: '8.9.0' })
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
@@ -894,7 +908,7 @@ cron.schedule('0 2 * * 0', async () => {
 
 // ── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log('GradeEdge API v8.8.0 running on port ' + PORT)
+  console.log('GradeEdge API v8.9.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
   console.log('Sell/Watch/Hold signal engine: momentum + net-margin, active')
   console.log('SportsCardsPro token configured:', !!process.env.SPORTSCARDSPRO_API_TOKEN)
