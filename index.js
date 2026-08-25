@@ -1,3 +1,5 @@
+require('./instrument.js')
+const Sentry = require('@sentry/node')
 require('dotenv').config()
 const express = require('express')
 const cors = require('cors')
@@ -907,6 +909,8 @@ cron.schedule('0 2 * * 0', async () => {
 }, { timezone: 'America/Denver' })
 
 // ── Start ───────────────────────────────────────────────────────────────────
+Sentry.setupExpressErrorHandler(app)
+
 app.listen(PORT, () => {
   console.log('GradeEdge API v8.9.0 running on port ' + PORT)
   console.log('Primary comp source: SportsCardsPro (sold-price based)')
