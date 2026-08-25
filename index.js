@@ -333,6 +333,39 @@ const SIGNAL_MOMENTUM_UP = 8    // % above baseline to count as "trending up"
 const SIGNAL_MOMENTUM_DOWN = -8 // % below baseline to count as "trending down"
 const SIGNAL_MIN_MARGIN = 15    // minimum net margin % required to call it GREEN
 
+// —— Event calendar for sell-timing signal ——————————————————————
+// Verified dates as of Aug 2026; approximate:true entries are typical seasonal
+// timing (not yet officially confirmed) and should be updated once announced.
+// Keep this in sync with EVENT_CALENDAR in gradeedge-app/src/App.jsx.
+const EVENT_CALENDAR = [
+  { sport: 'Pokemon TCG', name: 'Pokémon World Championships (San Francisco)', date: '2026-08-28' },
+  { sport: 'Football', name: 'NFL 2026 Season Kickoff', date: '2026-09-09' },
+  { sport: 'Baseball', name: 'MLB Wild Card Round', date: '2026-09-29' },
+  { sport: 'Hockey', name: '2026-27 NHL Season Start', date: '2026-09-29' },
+  { sport: 'Baseball', name: 'MLB Division Series', date: '2026-10-03' },
+  { sport: 'Basketball', name: '2026-27 NBA Opening Night', date: '2026-10-20' },
+  { sport: 'Baseball', name: 'MLB World Series (Game 1)', date: '2026-10-23' },
+  { sport: 'Football', name: 'Super Bowl LXI', date: '2027-02-14' },
+  { sport: 'Basketball', name: 'NBA All-Star Weekend (Phoenix)', date: '2027-02-19' },
+  { sport: 'Baseball', name: 'MLB Opening Day (typical timing)', date: '2027-03-26', approximate: true },
+  { sport: 'Basketball', name: 'NBA Playoffs (typical start)', date: '2027-04-18', approximate: true },
+  { sport: 'Hockey', name: 'NHL Playoffs (typical start)', date: '2027-04-18', approximate: true },
+  { sport: 'Football', name: 'NFL Draft (typical timing)', date: '2027-04-22', approximate: true },
+]
+const EVENT_WINDOW_DAYS = 21 // an event within this many days counts as "imminent" for the sell signal
+
+// Returns the soonest upcoming event for a sport (or null), with daysUntil computed from now.
+function nextEventForSport(sport) {
+  if (!sport) return null
+  const now = Date.now()
+  const upcoming = EVENT_CALENDAR
+    .filter(e => e.sport === sport)
+    .map(e => ({ ...e, daysUntil: Math.ceil((new Date(e.date + 'T00:00:00Z').getTime() - now) / 86400000) }))
+    .filter(e => e.daysUntil >= 0)
+    .sort((a, b) => a.daysUntil - b.daysUntil)
+  return upcoming[0] || null
+}
+
 function computeSellSignal(card) {
   const history = Array.isArray(card.comp_history) ? card.comp_history : []
   const tierKey = tierKeyForCard(card)
@@ -361,23 +394,33 @@ function computeSellSignal(card) {
   const roundedMargin = netMarginPct != null ? Math.round(netMarginPct * 10) / 10 : null
 
   let color = 'yellow', reason = 'Stable — price within normal range of baseline'
-  if (netMarginPct != null && netMarginPct < 0) {
-    color = 'red'
-    reason = `Would net a loss after fees/shipping (${roundedMargin}%) — hold`
-  } else if (momentumPct <= SIGNAL_MOMENTUM_DOWN) {
-    color = 'red'
-    reason = `Price trending down ${Math.abs(roundedMomentum)}% vs recent baseline — don't list into a falling market`
-  } else if (momentumPct >= SIGNAL_MOMENTUM_UP && netMarginPct != null && netMarginPct >= SIGNAL_MIN_MARGIN) {
-    color = 'green'
-    reason = `Price up ${roundedMomentum}% vs baseline with ${roundedMargin}% net margin — good time to sell`
-  } else if (momentumPct >= SIGNAL_MOMENTUM_UP) {
-    color = 'yellow'
-    reason = allInCost
-      ? `Price trending up ${roundedMomentum}% but net margin (${roundedMargin}%) is below the ${SIGNAL_MIN_MARGIN}% target — watch`
-      : `Price trending up ${roundedMomentum}% — set a cost basis on this card to unlock margin-based sell alerts`
-  }
+      const nextEvent = nextEventForSport(card.sport)
+      const eventSoon = !!(nextEvent && nextEvent.daysUntil <= EVENT_WINDOW_DAYS)
+      const marginNote = netMarginPct == null
+        ? ''
+        : netMarginPct < 0
+          ? ` (would net ~${roundedMargin}% loss after fees/shipping at today's price — your call)`
+          : ` (≈${roundedMargin}% net margin at today's price)`
 
-  return { color, momentum_pct: roundedMomentum, net_margin_pct: roundedMargin, reason }
+      if (momentumPct <= SIGNAL_MOMENTUM_DOWN) {
+        color = 'red'
+        reason = `Price trending down ${Math.abs(roundedMomentum)}% vs recent baseline — don't list into a falling market`
+      } else if (momentumPct >= SIGNAL_MOMENTUM_UP && eventSoon) {
+        color = 'green'
+        reason = `Price up ${roundedMomentum}% AND ${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — strong window to sell`
+      } else if (momentumPct >= SIGNAL_MOMENTUM_UP) {
+        color = 'green'
+        reason = `Price up ${roundedMomentum}% vs baseline — good time to sell`
+      } else if (eventSoon) {
+        color = 'green'
+        reason = `${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — ${card.sport || 'this'} cards often see buyer interest spike around this window`
+      } else if (nextEvent) {
+        reason = `Stable for now — ${nextEvent.name} is ${nextEvent.daysUntil} days out, worth watching as it nears`
+      }
+
+      reason += marginNote
+
+      return { color, momentum_pct: roundedMomentum, net_margin_pct: roundedMargin, reason, next_event_name: nextEvent ? nextEvent.name : null, next_event_days: nextEvent ? nextEvent.daysUntil : null }
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────────
@@ -494,13 +537,13 @@ app.post('/api/comps/approve', async (req, res) => {
   if (!cardId) return res.status(400).json({ error: 'cardId required' })
   try {
     const now = new Date().toISOString()
-    const { data: existing } = await supabase.from('cards').select('grade, all_in_cost, comp_today, comp_30d, comp_history').eq('id', cardId).single()
+    const { data: existing } = await supabase.from('cards').select('grade, sport, all_in_cost, comp_today, comp_30d, comp_history').eq('id', cardId).single()
     const prevHistory = existing?.comp_history || []
     const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null, source: 'SportsCardsPro' }].slice(-52)
     const tierKey = tierKeyForCard({ grade: existing?.grade })
     const todayComp = pickTodayComp({ matched: true, raw, psa9, psa10 }, tierKey)
     const comp30 = find30dAgoValue(prevHistory, tierKey) ?? existing?.comp_30d ?? null
-    const signal = computeSellSignal({ grade: existing?.grade, all_in_cost: existing?.all_in_cost, comp_today: todayComp ?? existing?.comp_today, comp_history: updatedHistory })
+    const signal = computeSellSignal({ grade: existing?.grade, sport: existing?.sport, all_in_cost: existing?.all_in_cost, comp_today: todayComp ?? existing?.comp_today, comp_history: updatedHistory })
     const { error } = await supabase.from('cards').update({
       comp_raw: raw ?? null, comp_psa9: psa9 ?? null, comp_psa10: psa10 ?? null,
       comp_today: todayComp ?? existing?.comp_today ?? null,
@@ -763,7 +806,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
     // player_name/brand_parallel/card_number naming used internally by fetchTiersFromSCP) —
     // map them here rather than selecting nonexistent columns.
     const { data: rows, error } = await supabase.from('cards')
-      .select('id, player, brand, parallel, card_num, year, numbered, grade, all_in_cost, comp_today, comp_30d, comp_history')
+      .select('id, player, brand, parallel, card_num, year, numbered, grade, sport, all_in_cost, comp_today, comp_30d, comp_history')
     if (error) throw error
     const cards = rows.map(row => ({
       id: row.id,
@@ -773,6 +816,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
       year: row.year,
       numbered: row.numbered,
       grade: row.grade,
+      sport: row.sport,
       all_in_cost: row.all_in_cost,
       comp_today: row.comp_today,
       comp_30d: row.comp_30d,
@@ -794,7 +838,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
             const todayComp = pickTodayComp(scp, tierKey)
             const comp30 = find30dAgoValue(card.comp_history || [], tierKey) ?? card.comp_30d ?? null
             const history = [...(card.comp_history || []), { date: now, raw: scp.raw, psa9: scp.psa9, psa10: scp.psa10, source: 'SportsCardsPro' }].slice(-52)
-            const signal = computeSellSignal({ grade: card.grade, all_in_cost: card.all_in_cost, comp_today: todayComp ?? card.comp_today, comp_history: history })
+            const signal = computeSellSignal({ grade: card.grade, sport: card.sport, all_in_cost: card.all_in_cost, comp_today: todayComp ?? card.comp_today, comp_history: history })
             await supabase.from('cards').update({
               comp_raw: scp.raw, comp_psa9: scp.psa9, comp_psa10: scp.psa10,
               comp_today: todayComp ?? card.comp_today ?? null, comp_30d: comp30,
@@ -823,7 +867,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
 app.post('/api/signal/recompute-all', async (req, res) => {
   try {
     const { data: rows, error } = await supabase.from('cards')
-      .select('id, grade, all_in_cost, comp_today, comp_history')
+      .select('id, grade, sport, all_in_cost, comp_today, comp_history')
     if (error) throw error
     res.json({ started: true, totalCards: rows.length })
 
@@ -854,7 +898,7 @@ cron.schedule('0 2 * * 0', async () => {
     // referenced player_name/brand_parallel/card_number, which don't exist on the table, so this
     // cron has been throwing (and silently doing nothing) on every scheduled run. Fixed here.
     const { data: rows } = await supabase.from('cards')
-      .select('id, player, brand, parallel, card_num, year, numbered, grade, all_in_cost, comp_raw, comp_psa9, comp_psa10, comp_today, comp_30d, comp_history')
+      .select('id, player, brand, parallel, card_num, year, numbered, grade, sport, all_in_cost, comp_raw, comp_psa9, comp_psa10, comp_today, comp_30d, comp_history')
       .eq('comp_auto_refresh', true)
     if (!rows || rows.length === 0) return console.log('[CronRefresh] No cards to refresh')
     const cards = rows.map(row => ({
@@ -865,6 +909,7 @@ cron.schedule('0 2 * * 0', async () => {
       year: row.year,
       numbered: row.numbered,
       grade: row.grade,
+      sport: row.sport,
       all_in_cost: row.all_in_cost,
       comp_raw: row.comp_raw,
       comp_psa9: row.comp_psa9,
@@ -888,7 +933,7 @@ cron.schedule('0 2 * * 0', async () => {
         const todayComp = pickTodayComp(scpFlat, tierKey)
         const comp30 = find30dAgoValue(card.comp_history || [], tierKey) ?? card.comp_30d ?? null
         const history = [...(card.comp_history || []), { date: now, raw: scpFlat.raw, psa9: scpFlat.psa9, psa10: scpFlat.psa10, source: 'SportsCardsPro' }].slice(-52)
-        const signal = computeSellSignal({ grade: card.grade, all_in_cost: card.all_in_cost, comp_today: todayComp ?? card.comp_today, comp_history: history })
+        const signal = computeSellSignal({ grade: card.grade, sport: card.sport, all_in_cost: card.all_in_cost, comp_today: todayComp ?? card.comp_today, comp_history: history })
         await supabase.from('cards').update({
           comp_raw: scpFlat.raw ?? card.comp_raw,
           comp_psa9: scpFlat.psa9 ?? card.comp_psa9,
