@@ -378,6 +378,21 @@ function nextEventForSport(sport) {
   return upcoming[0] || null
 }
 
+const ELITE_PLAYERS = [
+  'michael jordan', 'kobe bryant', 'lebron james', 'magic johnson', 'larry bird', 'wilt chamberlain', 'kareem abdul-jabbar', 'shaquille o\'neal', 'tim duncan', 'stephen curry',
+  'tom brady', 'patrick mahomes', 'jerry rice', 'peyton manning', 'joe montana', 'joe burrow',
+  'shohei ohtani', 'babe ruth', 'mickey mantle', 'derek jeter', 'ken griffey jr', 'mike trout', 'barry bonds', 'hank aaron', 'willie mays', 'juan soto',
+  'wayne gretzky', 'sidney crosby', 'connor mcdavid'
+]
+function isElitePlayer(name) {
+  if (!name) return false
+  const n = String(name).toLowerCase()
+  return ELITE_PLAYERS.some(p => n.includes(p))
+}
+
+const SIGNAL_NEAR_PEAK_PCT = 5  // today's price within this % of its tracked high counts as "at the real peak window"
+const SIGNAL_OFF_PEAK_PCT = 20  // today's price this far below its tracked high, combined with falling momentum, confirms the peak has passed
+
 function computeSellSignal(card) {
   const history = Array.isArray(card.comp_history) ? card.comp_history : []
   const tierKey = tierKeyForCard(card)
@@ -414,9 +429,28 @@ function computeSellSignal(card) {
           ? ` (would net ~${roundedMargin}% loss after fees/shipping at today's price — your call)`
           : ` (≈${roundedMargin}% net margin at today's price)`
 
-      if (momentumPct <= SIGNAL_MOMENTUM_DOWN) {
-        color = 'red'
-        reason = `Price trending down ${Math.abs(roundedMomentum)}% vs recent baseline — don't list into a falling market`
+      const athVal = Math.max(...withVals, todayVal)
+      const pctOfPeak = athVal > 0 ? (todayVal / athVal) * 100 : 100
+      const roundedPeakPct = Math.round(pctOfPeak * 10) / 10
+      const nearPeak = pctOfPeak >= (100 - SIGNAL_NEAR_PEAK_PCT)
+      const wellOffPeak = pctOfPeak <= (100 - SIGNAL_OFF_PEAK_PCT)
+      const isElite = isElitePlayer(card.player)
+
+      if (nearPeak) {
+        color = 'green'
+        reason = eventSoon
+          ? `At ${roundedPeakPct}% of its tracked high price AND ${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — strong window to sell`
+          : `At ${roundedPeakPct}% of its tracked high price — this is close to the best real price this card has seen, strong window to sell`
+      } else if (momentumPct <= SIGNAL_MOMENTUM_DOWN) {
+        if (isElite && !wellOffPeak) {
+          color = 'yellow'
+          reason = `Down ${Math.abs(roundedMomentum)}% short-term, but this is a blue-chip/HOF card — these have historically held or grown in value long-term, a short dip usually isn't a sell signal`
+        } else {
+          color = 'red'
+          reason = wellOffPeak
+            ? `Price trending down ${Math.abs(roundedMomentum)}% and ${Math.round(100 - roundedPeakPct)}% off its tracked high — the peak window has likely passed, don't wait for it to come back`
+            : `Price trending down ${Math.abs(roundedMomentum)}% vs recent baseline — don't list into a falling market`
+        }
       } else if (momentumPct >= SIGNAL_MOMENTUM_UP && eventSoon) {
         color = 'green'
         reason = `Price up ${roundedMomentum}% AND ${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — strong window to sell`
@@ -424,15 +458,18 @@ function computeSellSignal(card) {
         color = 'green'
         reason = `Price up ${roundedMomentum}% vs baseline — good time to sell`
       } else if (eventSoon) {
-        color = 'green'
-        reason = `${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — ${card.sport || 'this'} cards often see buyer interest spike around this window`
+        reason = isElite
+          ? `${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — worth watching, but no rush selling a card like this on anticipation alone`
+          : `${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away but price hasn't reacted yet — watch closely, don't sell on anticipation alone`
       } else if (nextEvent) {
         reason = `Stable for now — ${nextEvent.name} is ${nextEvent.daysUntil} days out, worth watching as it nears`
+      } else if (isElite) {
+        reason = 'Stable — blue-chip/HOF card, these have historically trended up over the long run so holding is reasonable absent a specific catalyst'
       }
 
       reason += marginNote
 
-      return { color, momentum_pct: roundedMomentum, net_margin_pct: roundedMargin, reason, next_event_name: nextEvent ? nextEvent.name : null, next_event_days: nextEvent ? nextEvent.daysUntil : null }
+      return { color, momentum_pct: roundedMomentum, net_margin_pct: roundedMargin, pct_of_peak: roundedPeakPct, is_elite_player: isElite, reason, next_event_name: nextEvent ? nextEvent.name : null, next_event_days: nextEvent ? nextEvent.daysUntil : null }
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────────
