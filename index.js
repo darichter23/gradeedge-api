@@ -742,64 +742,63 @@ app.post('/api/scan', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'im
 // Vision's assessment toward how each grader actually tends to score, since a flat "grade this
 // card" prompt would ignore real differences between PSA/BGS/SGC/CGC standards.
 const GRADER_STANDARDS = {
-    PSA: 'PSA grades on a whole-number 1-10 scale (no half grades). Gem Mint 10 requires centering of roughly 55/45 or better on the front (up to 60/40 on some earlier issues), corners sharp with no visible wear, edges clean with no chipping, and a surface free of print defects, scratches, creases, or wax staining. PSA is generally considered stricter on centering than SGC.',
-    BGS: 'Beckett (BGS) grades each of centering, corners, edges, and surface individually on a 1-10 scale (half-points allowed, e.g. 9.5) and averages them into an overall grade; a "Black Label" 10 requires all four subgrades at a true 10. Centering tolerance is comparable to PSA. Because subgrades are reported separately, a single weak corner can cap the overall grade even if everything else is pristine.',
-    SGC: 'SGC grades on a whole-number 1-10 scale (Pristine 10 at the top). SGC has a reputation for being somewhat more consistent/lenient on centering tolerance than PSA on some vintage issues, but still penalizes soft corners, edge chipping, and surface wear heavily at the top grades.',
-    CGC: 'CGC (Certified Guaranty Company) grades on a whole-number 1-10 scale including a Pristine 10 tier. Standards are broadly comparable to PSA/SGC for centering, corners, edges, and surface; CGC has built strong market trust particularly for modern and Pokémon/TCG cards.',
+  PSA: 'PSA grades on a whole-number 1-10 scale (no half grades). Gem Mint 10 requires centering of roughly 55/45 or better on the front (up to 60/40 on some earlier issues), corners sharp with no visible wear, edges clean with no chipping, and a surface free of print defects, scratches, creases, or wax staining. PSA is generally considered stricter on centering than SGC.',
+  BGS: 'Beckett (BGS) grades each of centering, corners, edges, and surface individually on a 1-10 scale (half-points allowed, e.g. 9.5) and averages them into an overall grade; a "Black Label" 10 requires all four subgrades at a true 10. Centering tolerance is comparable to PSA. Because subgrades are reported separately, a single weak corner can cap the overall grade even if everything else is pristine.',
+  SGC: 'SGC grades on a whole-number 1-10 scale (Pristine 10 at the top). SGC has a reputation for being somewhat more consistent/lenient on centering tolerance than PSA on some vintage issues, but still penalizes soft corners, edge chipping, and surface wear heavily at the top grades.',
+  CGC: 'CGC (Certified Guaranty Company) grades on a whole-number 1-10 scale including a Pristine 10 tier. Standards are broadly comparable to PSA/SGC for centering, corners, edges, and surface; CGC has built strong market trust particularly for modern and Pokémon/TCG cards.',
 }
 
 app.post('/api/pregrade', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
-    try {
-          function extractImage(fileField, bodyField) {
-                  if (req.files && req.files[fileField] && req.files[fileField][0]) {
-                            const f = req.files[fileField][0]
-                            return { mediaType: f.mimetype || 'image/jpeg', base64: f.buffer.toString('base64') }
-                  }
-                  if (req.body[bodyField]) {
-                            const match = req.body[bodyField].match(/^data:([^;]+);base64,(.+)$/)
-                            if (match) return { mediaType: match[1], base64: match[2] }
-                            return { mediaType: 'image/jpeg', base64: req.body[bodyField] }
-                  }
-                  return null
-          }
-          const front = extractImage('image', 'image')
-          const back = extractImage('imageBack', 'imageBack')
-          if (!front) return res.status(400).json({ error: 'No front image provided' })
-          if (!back) return res.status(400).json({ error: 'A back image is required for an accurate pre-grade estimate' })
-      
-          const graderInput = (req.body.grader || 'PSA').toUpperCase()
-          const grader = GRADER_STANDARDS[graderInput] ? graderInput : 'PSA'
-          const standardsNote = GRADER_STANDARDS[grader]
-      
-          const content = [
-            { type: 'image', source: { type: 'base64', media_type: front.mediaType, data: front.base64 } },
-            { type: 'image', source: { type: 'base64', media_type: back.mediaType, data: back.base64 } },
-            {
-                      type: 'text',
-                      text: `You are an expert sports/TCG card grader. The first image is the FRONT of the card, the second image is the BACK. Assess this card's condition as if pre-screening it for submission to ${grader}, using ${grader}'s actual grading standards: ${standardsNote}
-                      
-                      Give an honest, conservative assessment — this is used by a collector to decide whether a card is worth the cost of professional grading, so do not inflate the estimate. Note visible flaws precisely (e.g. "soft corner, bottom-left" rather than just "corners good"). If image quality, glare, or angle limits your ability to judge a specific aspect, say so in that aspect's assessment rather than guessing confidently.
-                      
-                      Return ONLY valid JSON with no markdown, in exactly this shape:
-                      {"grader":"${grader}","centering":{"assessment":"1-2 sentence assessment","estimate":"e.g. 55/45 or null if not assessable"},"corners":{"assessment":"1-2 sentence assessment","condition":"sharp|slightly worn|worn"},"edges":{"assessment":"1-2 sentence assessment","condition":"clean|minor chipping|worn"},"surface":{"assessment":"1-2 sentence assessment","condition":"clean|minor flaws|notable flaws"},"estimatedGradeRange":"e.g. 8-9","gradable":true,"gradableReasoning":"1-2 sentences on why it is or isn't worth submitting for grading at this estimated range","limitations":"1-2 sentences noting this is a photo-based estimate only, not a substitute for in-hand professional grading, and what (if anything) limited this assessment"}`,
-            },
-                ]
-      
-          const message = await anthropic.messages.create({
-                  model: 'claude-sonnet-5', max_tokens: 700,
-                  messages: [{ role: 'user', content }]
-          })
-          const responseText = message.content[0].text.trim()
-          let pregradeData
-          try { const m = responseText.match(/\{[\s\S]*\}/); pregradeData = JSON.parse(m ? m[0] : responseText) }
-          catch (e) { return res.status(500).json({ error: 'Could not parse pre-grade data', raw: responseText }) }
-          res.json({ success: true, pregrade: pregradeData, assessedAt: new Date().toISOString() })
-    } catch (err) {
-          console.error('[Pregrade] error:', err.message)
-          res.status(500).json({ error: err.message })
+  try {
+    function extractImage(fileField, bodyField) {
+      if (req.files && req.files[fileField] && req.files[fileField][0]) {
+        const f = req.files[fileField][0]
+        return { mediaType: f.mimetype || 'image/jpeg', base64: f.buffer.toString('base64') }
+      }
+      if (req.body[bodyField]) {
+        const match = req.body[bodyField].match(/^data:([^;]+);base64,(.+)$/)
+        if (match) return { mediaType: match[1], base64: match[2] }
+        return { mediaType: 'image/jpeg', base64: req.body[bodyField] }
+      }
+      return null
     }
-})
+    const front = extractImage('image', 'image')
+    const back = extractImage('imageBack', 'imageBack')
+    if (!front) return res.status(400).json({ error: 'No front image provided' })
+    if (!back) return res.status(400).json({ error: 'A back image is required for an accurate pre-grade estimate' })
 
+    const graderInput = (req.body.grader || 'PSA').toUpperCase()
+    const grader = GRADER_STANDARDS[graderInput] ? graderInput : 'PSA'
+    const standardsNote = GRADER_STANDARDS[grader]
+
+    const content = [
+      { type: 'image', source: { type: 'base64', media_type: front.mediaType, data: front.base64 } },
+      { type: 'image', source: { type: 'base64', media_type: back.mediaType, data: back.base64 } },
+      {
+        type: 'text',
+        text: `You are an expert sports/TCG card grader. The first image is the FRONT of the card, the second image is the BACK. Assess this card's condition as if pre-screening it for submission to ${grader}, using ${grader}'s actual grading standards: ${standardsNote}
+
+Give an honest, conservative assessment — this is used by a collector to decide whether a card is worth the cost of professional grading, so do not inflate the estimate. Note visible flaws precisely (e.g. "soft corner, bottom-left" rather than just "corners good"). If image quality, glare, or angle limits your ability to judge a specific aspect, say so in that aspect's assessment rather than guessing confidently.
+
+Return ONLY valid JSON with no markdown, in exactly this shape:
+{"grader":"${grader}","centering":{"assessment":"1-2 sentence assessment","estimate":"e.g. 55/45 or null if not assessable"},"corners":{"assessment":"1-2 sentence assessment","condition":"sharp|slightly worn|worn"},"edges":{"assessment":"1-2 sentence assessment","condition":"clean|minor chipping|worn"},"surface":{"assessment":"1-2 sentence assessment","condition":"clean|minor flaws|notable flaws"},"estimatedGradeRange":"e.g. 8-9","gradable":true,"gradableReasoning":"1-2 sentences on why it is or isn't worth submitting for grading at this estimated range","limitations":"1-2 sentences noting this is a photo-based estimate only, not a substitute for in-hand professional grading, and what (if anything) limited this assessment"}`,
+      },
+    ]
+
+    const message = await anthropic.messages.create({
+      model: 'claude-sonnet-5', max_tokens: 700,
+      messages: [{ role: 'user', content }]
+    })
+    const responseText = message.content[0].text.trim()
+    let pregradeData
+    try { const m = responseText.match(/\{[\s\S]*\}/); pregradeData = JSON.parse(m ? m[0] : responseText) }
+    catch (e) { return res.status(500).json({ error: 'Could not parse pre-grade data', raw: responseText }) }
+    res.json({ success: true, pregrade: pregradeData, assessedAt: new Date().toISOString() })
+  } catch (err) {
+    console.error('[Pregrade] error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
 // ── Bulk Comps (legacy eBay path — small manual batches, unrelated to the SCP backfill below) ──
 app.post('/api/comps/bulk', async (req, res) => {
   try {
