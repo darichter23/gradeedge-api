@@ -799,6 +799,7 @@ Return ONLY valid JSON with no markdown, in exactly this shape:
     res.status(500).json({ error: err.message })
   }
 })
+
 // ── Bulk Comps (legacy eBay path — small manual batches, unrelated to the SCP backfill below) ──
 app.post('/api/comps/bulk', async (req, res) => {
   try {
