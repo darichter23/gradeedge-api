@@ -789,7 +789,11 @@ Return ONLY valid JSON with no markdown, in exactly this shape:
       model: 'claude-sonnet-5', max_tokens: 1200,
       messages: [{ role: 'user', content }]
     })
-    const responseText = message.content[0].text.trim()
+    const textBlock = (message.content || []).find(b => b.type === 'text')
+    if (message.stop_reason === 'refusal' || !textBlock) {
+      return res.status(422).json({ error: 'The AI could not analyze these photos. Try clearer, well-lit photos of the front and back of the actual card, then try again.' })
+    }
+    const responseText = textBlock.text.trim()
     let pregradeData
     try { const m = responseText.match(/\{[\s\S]*\}/); pregradeData = JSON.parse(m ? m[0] : responseText) }
     catch (e) { return res.status(500).json({ error: 'Could not parse pre-grade data', raw: responseText }) }
