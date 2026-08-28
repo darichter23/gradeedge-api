@@ -7,7 +7,9 @@ const fetch = require('node-fetch')
 const multer = require('multer')
 const Anthropic = require('@anthropic-ai/sdk')
 const cron = require('node-cron');
+const rateLimit = require('express-rate-limit')
 const app = express()
+app.set('trust proxy', 1)
 const PORT = process.env.PORT || 3001
 
 app.use(cors({ origin: true, credentials: true }))
@@ -17,6 +19,36 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const { createClient } = require('@supabase/supabase-js')
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY)
+
+// ── Security: AI-cost rate limit + Supabase-auth gate ────────────────────────────
+const aiLimiter = rateLimit({
+ windowMs: 24 * 60 * 60 * 1000,
+ max: 50,
+ standardHeaders: true,
+ legacyHeaders: false,
+ keyGenerator: (req) => (req.user && req.user.id) || req.ip,
+ message: { error: 'Daily AI usage limit reached. Please try again tomorrow.' }
+})
+
+async function requireAuth(req, res, next) {
+ try {
+ const internalKey = req.headers['x-internal-key']
+ if (internalKey && process.env.SUPABASE_SERVICE_KEY && internalKey === process.env.SUPABASE_SERVICE_KEY) {
+ req.user = null
+ return next()
+ }
+ const authHeader = req.headers.authorization || ''
+ const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
+ if (!token) return res.status(401).json({ error: 'Missing or invalid Authorization header' })
+ const { data, error } = await supabase.auth.getUser(token)
+ if (error || !data || !data.user) return res.status(401).json({ error: 'Invalid or expired session' })
+ req.user = data.user
+ next()
+ } catch (e) {
+ console.error('[requireAuth] error:', e.message)
+ res.status(401).json({ error: 'Authentication failed' })
+ }
+}
 
 // ── eBay OAuth token cache ──────────────────────────────────────────────────
 let ebayToken = null
@@ -478,7 +510,7 @@ app.get('/', (req, res) => {
 })
 
 // Single-grade comp (used by edit modal / LiveCompFetcher) — still eBay-based for now.
-app.get('/api/comps', async (req, res) => {
+app.get('/api/comps', requireAuth, async (req, res) => {
   try {
     const { player, brand, year, grade, cardNum, numbered } = req.query
     if (!player) return res.status(400).json({ error: 'player is required' })
@@ -543,7 +575,7 @@ app.get('/api/comps', async (req, res) => {
 // Primary automated comp source — powers the inventory table columns, Approve & Save,
 // the weekly auto-refresh cron, and the Sell/Watch/Hold signal.
 // Migrated from eBay Browse API (active listings) to SportsCardsPro (sold-price based) for accuracy.
-app.post('/api/comps/tiers', async (req, res) => {
+app.post('/api/comps/tiers', requireAuth, async (req, res) => {
   const { card } = req.body
   if (!card) return res.status(400).json({ error: 'Card data is required' })
   if (!card.player_name && !card.brand_parallel) {
@@ -581,7 +613,7 @@ app.post('/api/comps/tiers', async (req, res) => {
 })
 
 // APPROVE COMPS — save to Supabase + enable auto-refresh
-app.post('/api/comps/approve', async (req, res) => {
+app.post('/api/comps/approve', requireAuth, async (req, res) => {
   const { cardId, raw, psa9, psa10, autoRefresh } = req.body
   if (!cardId) return res.status(400).json({ error: 'cardId required' })
   try {
@@ -622,7 +654,7 @@ app.post('/api/comps/approve', async (req, res) => {
 // database exists here, so this searches SportsCardsPro's card catalog for the partial query and
 // dedupes the player names found in matching card titles — coverage follows whatever players SCP
 // has cards for, which is effectively every notable athlete across the sports/TCG categories it sells.
-app.get('/api/players/search', async (req, res) => {
+app.get('/api/players/search', requireAuth, async (req, res) => {
   try {
     const q = (req.query.q || '').trim()
     if (q.length < 2) return res.json({ players: [] })
@@ -648,7 +680,7 @@ app.get('/api/players/search', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
-app.post('/api/watchlist/alerts', async (req, res) => {
+app.post('/api/watchlist/alerts', requireAuth, async (req, res) => {
   try {
     const { items } = req.body
     if (!items || !Array.isArray(items) || !items.length) return res.status(400).json({ error: 'items array required' })
@@ -696,7 +728,7 @@ app.post('/api/watchlist/alerts', async (req, res) => {
 })
 
 // ── AI Card Scanner ─────────────────────────────────────────────────────────
-app.post('/api/scan', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
+app.post('/api/scan', requireAuth, aiLimiter, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
   try {
     function extractImage(fileField, bodyField) {
       if (req.files && req.files[fileField] && req.files[fileField][0]) {
@@ -748,7 +780,7 @@ const GRADER_STANDARDS = {
   CGC: 'CGC (Certified Guaranty Company) grades on a whole-number 1-10 scale including a Pristine 10 tier. Standards are broadly comparable to PSA/SGC for centering, corners, edges, and surface; CGC has built strong market trust particularly for modern and Pokémon/TCG cards.',
 }
 
-app.post('/api/pregrade', upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
+app.post('/api/pregrade', requireAuth, aiLimiter, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
   try {
     function extractImage(fileField, bodyField) {
       if (req.files && req.files[fileField] && req.files[fileField][0]) {
@@ -805,7 +837,7 @@ Return ONLY valid JSON with no markdown, in exactly this shape:
 })
 
 // ── Bulk Comps (legacy eBay path — small manual batches, unrelated to the SCP backfill below) ──
-app.post('/api/comps/bulk', async (req, res) => {
+app.post('/api/comps/bulk', requireAuth, async (req, res) => {
   try {
     const { cards } = req.body
     if (!cards || !Array.isArray(cards)) return res.status(400).json({ error: 'cards array required' })
@@ -825,7 +857,7 @@ app.post('/api/comps/bulk', async (req, res) => {
 })
 
 // ── SportsCardsPro multi-grade pricing (raw / PSA / BGS / CGC / SGC) — on-demand lookup tool ──
-app.get('/api/comps/multigrade', async (req, res) => {
+app.get('/api/comps/multigrade', requireAuth, async (req, res) => {
   try {
     const { player, year, brand, cardNum, parallel, numbered } = req.query
     if (!player) return res.status(400).json({ error: 'player is required' })
@@ -916,7 +948,7 @@ app.get('/api/comps/multigrade', async (req, res) => {
   }
 })
 
-app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
+app.post('/api/comps/bulk-scp-refresh', requireAuth, async (req, res) => {
   try {
     // NOTE: actual Supabase column names are player/brand/parallel/card_num (not the
     // player_name/brand_parallel/card_number naming used internally by fetchTiersFromSCP) —
@@ -980,7 +1012,7 @@ app.post('/api/comps/bulk-scp-refresh', async (req, res) => {
 // from data already stored in Supabase (comp_today, comp_history, all_in_cost) — no external API
 // calls, so it runs fast with no rate-limit wait. Use this after deploying a new signal algorithm
 // version, or any time thresholds change, to re-grade all cards without re-pulling comps.
-app.post('/api/signal/recompute-all', async (req, res) => {
+app.post('/api/signal/recompute-all', requireAuth, async (req, res) => {
   try {
     const { data: rows, error } = await supabase.from('cards')
       .select('id, grade, sport, all_in_cost, comp_today, comp_history')
@@ -1039,7 +1071,7 @@ cron.schedule('0 2 * * 0', async () => {
       try {
         const r = await fetch('https://gradeedge-api-production.up.railway.app/api/comps/tiers', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'x-internal-key': process.env.SUPABASE_SERVICE_KEY },
           body: JSON.stringify({ card })
         })
         const { raw, psa9, psa10, matched } = await r.json()
