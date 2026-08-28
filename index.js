@@ -114,7 +114,7 @@ async function fetchItems(query, limit) {
 }
 
 // ── Build precise eBay search queries per grade tier ───────────────────────
-function buildRawQuery(player, year, brand, cardNum) {
+function buildRawQuery(player, year, brand, cardNum, parallel) {
   const parts = []
   if (player) parts.push(player.trim())
   if (year) parts.push(String(year))
@@ -123,6 +123,7 @@ function buildRawQuery(player, year, brand, cardNum) {
     parts.push(words)
   }
   if (cardNum) parts.push('#' + String(cardNum).replace(/^#/, ''))
+  if (parallel) parts.push(parallel.trim())
   const q = parts.join(' ')
   return q + ' -PSA -BGS -SGC -CGC -graded'
 }
@@ -688,9 +689,16 @@ app.post('/api/watchlist/alerts', requireAuth, async (req, res) => {
     const results = []
     for (const item of items.slice(0, 25)) {
       try {
-        const query = buildRawQuery(item.player_name, null, null, null)
+        const query = buildRawQuery(item.player_name, item.year, item.brand, item.card_number, item.parallel)
         const rawItems = await fetchItems(query, 30)
-        const listings = parseItems(rawItems)
+        let listings = parseItems(rawItems)
+        if (item.min_price != null || item.max_price != null) {
+          listings = listings.filter(l => {
+            if (item.min_price != null && l.price < Number(item.min_price)) return false
+            if (item.max_price != null && l.price > Number(item.max_price)) return false
+            return true
+          })
+        }
 
         let benchmark = null, benchmarkSource = null
         if (item.target_price) {
@@ -698,7 +706,7 @@ app.post('/api/watchlist/alerts', requireAuth, async (req, res) => {
           benchmarkSource = 'target price'
         } else {
           try {
-            const scp = await fetchTiersFromSCP({ player_name: item.player_name, brand_parallel: '', card_number: '', year: '' })
+            const scp = await fetchTiersFromSCP({ player_name: item.player_name, brand_parallel: [item.brand, item.parallel].filter(Boolean).join(' '), card_number: item.card_number || '', year: item.year || '' })
             if (scp.matched && scp.raw) { benchmark = scp.raw; benchmarkSource = 'market comp' }
           } catch (e) { /* no SCP match — fall back to unranked listings below */ }
         }
