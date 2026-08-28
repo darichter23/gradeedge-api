@@ -786,7 +786,7 @@ Return ONLY valid JSON with no markdown, in exactly this shape:
     ]
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-5', max_tokens: 700,
+      model: 'claude-sonnet-5', max_tokens: 1200,
       messages: [{ role: 'user', content }]
     })
     const responseText = message.content[0].text.trim()
