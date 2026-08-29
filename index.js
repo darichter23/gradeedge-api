@@ -397,7 +397,8 @@ const EVENT_CALENDAR = [
   { sport: 'Basketball', name: 'NBA All-Star Weekend 2028 (typical timing)', date: '2028-02-18', approximate: true },
   { sport: 'Baseball', name: 'MLB Opening Day 2028 (typical timing)', date: '2028-03-30', approximate: true },
 ]
-const EVENT_WINDOW_DAYS = 21 // an event within this many days counts as "imminent" for the sell signal
+const EVENT_WINDOW_DAYS = 21
+const SIGNAL_VOLUME_UP = 15     // % rise in sales volume (comp_history[].vol) vs baseline to count as "demand rising" // an event within this many days counts as "imminent" for the sell signal
 
 // Returns the soonest upcoming event for a sport (or null), with daysUntil computed from now.
 function nextEventForSport(sport) {
@@ -433,7 +434,7 @@ function computeSellSignal(card) {
   const todayVal = card.comp_today != null ? Number(card.comp_today) : (withVals.length ? withVals[withVals.length - 1] : null)
 
   if (withVals.length < 3 || todayVal == null) {
-    return { color: 'gray', momentum_pct: null, net_margin_pct: null, reason: 'Gathering price history — need 3+ weekly comp pulls before this signal is reliable' }
+    return { color: 'gray', momentum_pct: null, volume_momentum_pct: null, net_margin_pct: null, reason: 'Gathering price history — need 3+ weekly comp pulls before this signal is reliable' }
   }
 
   const recentPoints = [...withVals.slice(-2), todayVal]
@@ -443,6 +444,19 @@ function computeSellSignal(card) {
   const mediumAvg = baselinePoints.length ? baselinePoints.reduce((a, b) => a + b, 0) / baselinePoints.length : shortAvg
   const momentumPct = mediumAvg > 0 ? ((shortAvg - mediumAvg) / mediumAvg) * 100 : 0
 
+  // Volume/quantity momentum — rising sales volume signals demand heating up,
+  // independent of price. Same recent-vs-baseline windowing as price momentum,
+  // gracefully skipped when older comp_history entries predate volume tracking.
+  const volVals = history.filter(h => h.vol != null).map(h => Number(h.vol))
+  let volumeMomentumPct = null
+  if (volVals.length >= 2) {
+    const recentVol = volVals.slice(-2)
+    const shortVolAvg = recentVol.reduce((a, b) => a + b, 0) / recentVol.length
+    const priorVol = volVals.slice(0, -2)
+    const baselineVolAvg = priorVol.length ? priorVol.reduce((a, b) => a + b, 0) / priorVol.length : shortVolAvg
+    volumeMomentumPct = baselineVolAvg > 0 ? ((shortVolAvg - baselineVolAvg) / baselineVolAvg) * 100 : null
+  }
+
   const allInCost = card.all_in_cost != null ? Number(card.all_in_cost) : null
   let netMarginPct = null
   if (allInCost && allInCost > 0) {
@@ -451,58 +465,49 @@ function computeSellSignal(card) {
   }
 
   const roundedMomentum = Math.round(momentumPct * 10) / 10
+  const roundedVolMomentum = volumeMomentumPct != null ? Math.round(volumeMomentumPct * 10) / 10 : null
   const roundedMargin = netMarginPct != null ? Math.round(netMarginPct * 10) / 10 : null
 
   let color = 'yellow', reason = 'Stable — price within normal range of baseline'
-      const nextEvent = nextEventForSport(card.sport)
-      const eventSoon = !!(nextEvent && nextEvent.daysUntil <= EVENT_WINDOW_DAYS)
-      const marginNote = netMarginPct == null
-        ? ''
-        : netMarginPct < 0
-          ? ` (would net ~${roundedMargin}% loss after fees/shipping at today's price — your call)`
-          : ` (≈${roundedMargin}% net margin at today's price)`
+  const nextEvent = nextEventForSport(card.sport)
+  const eventSoon = !!(nextEvent && nextEvent.daysUntil <= EVENT_WINDOW_DAYS)
+  const volumeRising = roundedVolMomentum != null && roundedVolMomentum >= SIGNAL_VOLUME_UP
+  const marginNote = netMarginPct == null
+    ? ''
+    : netMarginPct < 0
+      ? ` (would net ~${roundedMargin}% loss after fees/shipping at today's price — your call)`
+      : ` (≈${roundedMargin}% net margin at today's price)`
 
-      const athVal = Math.max(...withVals, todayVal)
-      const pctOfPeak = athVal > 0 ? (todayVal / athVal) * 100 : 100
-      const roundedPeakPct = Math.round(pctOfPeak * 10) / 10
-      const nearPeak = pctOfPeak >= (100 - SIGNAL_NEAR_PEAK_PCT)
-      const wellOffPeak = pctOfPeak <= (100 - SIGNAL_OFF_PEAK_PCT)
-      const isElite = isElitePlayer(card.player)
+  if (momentumPct <= SIGNAL_MOMENTUM_DOWN) {
+    color = 'red'
+    reason = `Price trending down ${Math.abs(roundedMomentum)}% vs recent baseline — don't list into a falling market`
+  } else if (momentumPct >= SIGNAL_MOMENTUM_UP && volumeRising && eventSoon) {
+    color = 'green'
+    reason = `Price up ${roundedMomentum}% AND demand up ${roundedVolMomentum}% AND ${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — this is the window, list now`
+  } else if (momentumPct >= SIGNAL_MOMENTUM_UP && volumeRising) {
+    color = 'green'
+    reason = `Price up ${roundedMomentum}% and buyer demand (sales volume) up ${roundedVolMomentum}% — cards moving fast at rising prices, strong time to sell`
+  } else if (momentumPct >= SIGNAL_MOMENTUM_UP && eventSoon) {
+    color = 'green'
+    reason = `Price up ${roundedMomentum}% AND ${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — strong window to sell`
+  } else if (momentumPct >= SIGNAL_MOMENTUM_UP) {
+    color = 'green'
+    reason = `Price up ${roundedMomentum}% vs baseline — good time to sell`
+  } else if (volumeRising && momentumPct > 0) {
+    color = 'green'
+    reason = `Demand rising — sales volume up ${roundedVolMomentum}% with price already ticking up ${roundedMomentum}% — good time to sell before it cools`
+  } else if (eventSoon) {
+    color = 'green'
+    reason = `${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — ${card.sport || 'this'} cards often see buyer interest spike around this window`
+  } else if (volumeRising) {
+    reason = `Buyer demand climbing — sales volume up ${roundedVolMomentum}%, price hasn't followed yet. Worth watching closely.`
+  } else if (nextEvent) {
+    reason = `Stable for now — ${nextEvent.name} is ${nextEvent.daysUntil} days out, worth watching as it nears`
+  }
 
-      if (nearPeak) {
-        color = 'green'
-        reason = eventSoon
-          ? `At ${roundedPeakPct}% of its tracked high price AND ${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — strong window to sell`
-          : `At ${roundedPeakPct}% of its tracked high price — this is close to the best real price this card has seen, strong window to sell`
-      } else if (momentumPct <= SIGNAL_MOMENTUM_DOWN) {
-        if (isElite && !wellOffPeak) {
-          color = 'yellow'
-          reason = `Down ${Math.abs(roundedMomentum)}% short-term, but this is a blue-chip/HOF card — these have historically held or grown in value long-term, a short dip usually isn't a sell signal`
-        } else {
-          color = 'red'
-          reason = wellOffPeak
-            ? `Price trending down ${Math.abs(roundedMomentum)}% and ${Math.round(100 - roundedPeakPct)}% off its tracked high — the peak window has likely passed, don't wait for it to come back`
-            : `Price trending down ${Math.abs(roundedMomentum)}% vs recent baseline — don't list into a falling market`
-        }
-      } else if (momentumPct >= SIGNAL_MOMENTUM_UP && eventSoon) {
-        color = 'green'
-        reason = `Price up ${roundedMomentum}% AND ${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — strong window to sell`
-      } else if (momentumPct >= SIGNAL_MOMENTUM_UP) {
-        color = 'green'
-        reason = `Price up ${roundedMomentum}% vs baseline — good time to sell`
-      } else if (eventSoon) {
-        reason = isElite
-          ? `${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away — worth watching, but no rush selling a card like this on anticipation alone`
-          : `${nextEvent.name} is ${nextEvent.daysUntil} day${nextEvent.daysUntil === 1 ? '' : 's'} away but price hasn't reacted yet — watch closely, don't sell on anticipation alone`
-      } else if (nextEvent) {
-        reason = `Stable for now — ${nextEvent.name} is ${nextEvent.daysUntil} days out, worth watching as it nears`
-      } else if (isElite) {
-        reason = 'Stable — blue-chip/HOF card, these have historically trended up over the long run so holding is reasonable absent a specific catalyst'
-      }
+  reason += marginNote
 
-      reason += marginNote
-
-      return { color, momentum_pct: roundedMomentum, net_margin_pct: roundedMargin, pct_of_peak: roundedPeakPct, is_elite_player: isElite, reason, next_event_name: nextEvent ? nextEvent.name : null, next_event_days: nextEvent ? nextEvent.daysUntil : null }
+  return { color, momentum_pct: roundedMomentum, volume_momentum_pct: roundedVolMomentum, net_margin_pct: roundedMargin, reason, next_event_name: nextEvent ? nextEvent.name : null, next_event_days: nextEvent ? nextEvent.daysUntil : null }
 }
 
 // ── Routes ──────────────────────────────────────────────────────────────────
@@ -615,13 +620,13 @@ app.post('/api/comps/tiers', requireAuth, async (req, res) => {
 
 // APPROVE COMPS — save to Supabase + enable auto-refresh
 app.post('/api/comps/approve', requireAuth, async (req, res) => {
-  const { cardId, raw, psa9, psa10, autoRefresh } = req.body
+  const { cardId, raw, psa9, psa10, vol, autoRefresh } = req.body
   if (!cardId) return res.status(400).json({ error: 'cardId required' })
   try {
     const now = new Date().toISOString()
     const { data: existing } = await supabase.from('cards').select('grade, sport, all_in_cost, comp_today, comp_30d, comp_history').eq('id', cardId).single()
     const prevHistory = existing?.comp_history || []
-    const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null, source: 'SportsCardsPro' }].slice(-52)
+    const updatedHistory = [...prevHistory, { date: now, raw: raw ?? null, psa9: psa9 ?? null, psa10: psa10 ?? null, vol: vol ?? null, source: 'SportsCardsPro' }].slice(-52)
     const tierKey = tierKeyForCard({ grade: existing?.grade })
     const todayComp = pickTodayComp({ matched: true, raw, psa9, psa10 }, tierKey)
     const comp30 = find30dAgoValue(prevHistory, tierKey) ?? existing?.comp_30d ?? null
@@ -1084,11 +1089,11 @@ cron.schedule('0 2 * * 0', async () => {
         })
         const { raw, psa9, psa10, matched } = await r.json()
         const now = new Date().toISOString()
-        const scpFlat = { matched: !!matched, raw: raw?.median ?? null, psa9: psa9?.median ?? null, psa10: psa10?.median ?? null }
+        const scpFlat = { matched: !!matched, raw: raw?.median ?? null, psa9: psa9?.median ?? null, psa10: psa10?.median ?? null, vol: raw?.count ?? psa9?.count ?? psa10?.count ?? null }
         const tierKey = tierKeyForCard(card)
         const todayComp = pickTodayComp(scpFlat, tierKey)
         const comp30 = find30dAgoValue(card.comp_history || [], tierKey) ?? card.comp_30d ?? null
-        const history = [...(card.comp_history || []), { date: now, raw: scpFlat.raw, psa9: scpFlat.psa9, psa10: scpFlat.psa10, source: 'SportsCardsPro' }].slice(-52)
+        const history = [...(card.comp_history || []), { date: now, raw: scpFlat.raw, psa9: scpFlat.psa9, psa10: scpFlat.psa10, vol: scpFlat.vol, source: 'SportsCardsPro' }].slice(-52)
         const signal = computeSellSignal({ grade: card.grade, sport: card.sport, all_in_cost: card.all_in_cost, comp_today: todayComp ?? card.comp_today, comp_history: history })
         await supabase.from('cards').update({
           comp_raw: scpFlat.raw ?? card.comp_raw,
