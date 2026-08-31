@@ -77,15 +77,17 @@ async function getEbayToken() {
 }
 
 // ── Core eBay Browse API fetcher (still used by /api/comps single-grade lookup + /api/comps/bulk) ─
-async function fetchItems(query, limit) {
+async function fetchItems(query, limit, filter) {
   limit = limit || 100
   const token = await getEbayToken()
-  const params = new URLSearchParams({
+  const paramsObj = {
     q: query,
     limit: Math.min(limit, 200).toString(),
     sort: 'newlyListed',
     fieldgroups: 'MATCHING_ITEMS'
-  })
+  }
+  if (filter) paramsObj.filter = filter
+  const params = new URLSearchParams(paramsObj)
   const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?${params}`
   console.log('eBay query:', query)
   const res = await fetch(url, {
@@ -139,6 +141,20 @@ function buildGradedQuery(player, year, brand, cardNum, psaGrade) {
   if (cardNum) parts.push('#' + String(cardNum).replace(/^#/, ''))
   parts.push(`PSA ${psaGrade}`)
   return parts.join(' ')
+}
+
+// Build an eBay Browse API filter string for price range + listing (buying) type
+function buildEbayFilter(minPrice, maxPrice, listingType) {
+  const clauses = []
+  if (minPrice != null || maxPrice != null) {
+    const lo = minPrice != null ? minPrice : ''
+    const hi = maxPrice != null ? maxPrice : ''
+    clauses.push(`price:[${lo}..${hi}]`)
+    clauses.push('priceCurrency:USD')
+  }
+  if (listingType === 'FIXED_PRICE') clauses.push('buyingOptions:{FIXED_PRICE}')
+  else if (listingType === 'AUCTION') clauses.push('buyingOptions:{AUCTION}')
+  return clauses.length ? clauses.join(',') : null
 }
 
 // ── IQR outlier filter + stats ─────────────────────────────────────────────
@@ -695,7 +711,8 @@ app.post('/api/watchlist/alerts', requireAuth, async (req, res) => {
     for (const item of items.slice(0, 25)) {
       try {
         const query = buildRawQuery(item.player_name, item.year, item.brand, item.card_number, item.parallel)
-        const rawItems = await fetchItems(query, 30)
+        const ebayFilter = buildEbayFilter(item.min_price, item.max_price, item.listing_type)
+        const rawItems = await fetchItems(query, 100, ebayFilter)
         let listings = parseItems(rawItems)
         if (item.min_price != null || item.max_price != null) {
           listings = listings.filter(l => {
