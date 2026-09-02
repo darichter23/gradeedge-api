@@ -39,9 +39,15 @@ async function requireAuth(req, res, next) {
  }
  const authHeader = req.headers.authorization || ''
  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null
- if (!token) return res.status(401).json({ error: 'Missing or invalid Authorization header' })
+ if (!token) {
+ console.warn(`[requireAuth] 401 no-token path=${req.path} ip=${req.ip}`)
+ return res.status(401).json({ error: 'Missing or invalid Authorization header' })
+ }
  const { data, error } = await supabase.auth.getUser(token)
- if (error || !data || !data.user) return res.status(401).json({ error: 'Invalid or expired session' })
+ if (error || !data || !data.user) {
+ console.warn(`[requireAuth] 401 invalid-session path=${req.path} reason=${error && error.message} tokenLen=${token.length}`)
+ return res.status(401).json({ error: 'Invalid or expired session' })
+ }
  req.user = data.user
  next()
  } catch (e) {
