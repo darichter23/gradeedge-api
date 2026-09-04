@@ -848,13 +848,15 @@ app.post('/api/pregrade', requireAuth, aiLimiter, upload.fields([{ name: 'image'
 
 Give an honest, conservative assessment — this is used by a collector to decide whether a card is worth the cost of professional grading, so do not inflate the estimate. Note visible flaws precisely (e.g. "soft corner, bottom-left" rather than just "corners good"). If image quality, glare, or angle limits your ability to judge a specific aspect, say so in that aspect's assessment rather than guessing confidently. This is also sometimes used before the card is even purchased — e.g. from an eBay or CollX listing photo — to help decide whether it is worth buying in the first place; give a buy recommendation based purely on the card's assessed condition and grading potential, not price (you have no price data): "buy" if condition supports the estimated grade range well, "caution" for borderline flaws that could cap the grade, "pass" if condition issues make a low grade or non-gradable result likely.
 
+Also identify the card itself from these same photos — the back often has set/copyright info, and PSA/graded labels are on the slab holder which may be visible in either image. This saves the collector from having to scan the card a second time separately.
+
 Return ONLY valid JSON with no markdown, in exactly this shape:
-{"grader":"${grader}","centering":{"assessment":"1-2 sentence assessment","estimate":"e.g. 55/45 or null if not assessable"},"corners":{"assessment":"1-2 sentence assessment","condition":"sharp|slightly worn|worn"},"edges":{"assessment":"1-2 sentence assessment","condition":"clean|minor chipping|worn"},"surface":{"assessment":"1-2 sentence assessment","condition":"clean|minor flaws|notable flaws"},"estimatedGradeRange":"e.g. 8-9","gradable":true,"gradableReasoning":"1-2 sentences on why it is or isn't worth submitting for grading at this estimated range","buyRecommendation":{"verdict":"buy|caution|pass","reasoning":"2-3 sentences explaining the buy/caution/pass call based on condition and grading potential"},"limitations":"1-2 sentences noting this is a photo-based estimate only, not a substitute for in-hand professional grading, and what (if anything) limited this assessment"}`,
+{"card":{"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"},"grader":"${grader}","centering":{"assessment":"1-2 sentence assessment","estimate":"e.g. 55/45 or null if not assessable"},"corners":{"assessment":"1-2 sentence assessment","condition":"sharp|slightly worn|worn"},"edges":{"assessment":"1-2 sentence assessment","condition":"clean|minor chipping|worn"},"surface":{"assessment":"1-2 sentence assessment","condition":"clean|minor flaws|notable flaws"},"estimatedGradeRange":"e.g. 8-9","gradable":true,"gradableReasoning":"1-2 sentences on why it is or isn't worth submitting for grading at this estimated range","buyRecommendation":{"verdict":"buy|caution|pass","reasoning":"2-3 sentences explaining the buy/caution/pass call based on condition and grading potential"},"limitations":"1-2 sentences noting this is a photo-based estimate only, not a substitute for in-hand professional grading, and what (if anything) limited this assessment"}`,
       },
     ]
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-5', max_tokens: 1200,
+      model: 'claude-sonnet-5', max_tokens: 1500,
       messages: [{ role: 'user', content }]
     })
     const textBlock = (message.content || []).find(b => b.type === 'text')
@@ -865,7 +867,8 @@ Return ONLY valid JSON with no markdown, in exactly this shape:
     let pregradeData
     try { const m = responseText.match(/\{[\s\S]*\}/); pregradeData = JSON.parse(m ? m[0] : responseText) }
     catch (e) { return res.status(500).json({ error: 'Could not parse pre-grade data', raw: responseText }) }
-    res.json({ success: true, pregrade: pregradeData, assessedAt: new Date().toISOString() })
+    const { card: cardData, ...pregradeOnly } = pregradeData || {}
+    res.json({ success: true, card: cardData || null, pregrade: pregradeOnly, assessedAt: new Date().toISOString() })
   } catch (err) {
     console.error('[Pregrade] error:', err.message)
     res.status(500).json({ error: err.message })
