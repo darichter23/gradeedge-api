@@ -292,11 +292,13 @@ const base = pool.filter(p => !isParallelProduct(p['product-name']))
 if (base.length) best = base[0]
 }
 if (cardNumStr) {
-const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '')
-const num = norm(cardNumStr)
+const digits = cardNumStr.replace(/[^A-Za-z0-9]/g, '')
 const noParallelPool = pool.filter(p => !isParallelProduct(p['product-name']))
 const candidatePool = withMatchingParallel.length ? withMatchingParallel : (noParallelPool.length ? noParallelPool : pool)
-const withNum = candidatePool.find(p => norm(p['product-name'] || '').includes(num))
+// Require the card number as a standalone token (not adjacent to other alphanumerics) so a short
+// number like "#1" can't match by being a substring of an unrelated "#21", "/99" print run, etc.
+const numBoundaryRe = digits ? new RegExp(`(?<![A-Za-z0-9])${digits}(?![A-Za-z0-9])`, 'i') : null
+const withNum = numBoundaryRe ? candidatePool.find(p => numBoundaryRe.test(String(p['product-name'] || ''))) : null
 if (withNum) best = withNum
 }
 
