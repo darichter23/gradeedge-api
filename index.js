@@ -247,6 +247,7 @@ function extractPlayerNameFromProduct(productName) {
 // Two sequential API calls (search then detail) — internally paced to respect SCP's 1 req/sec limit.
 async function fetchTiersFromSCP(card) {
   const brandFull = card.brand_parallel ? String(card.brand_parallel).trim().replace(/\s+/g, ' ') : ''
+  const parallelName = card.parallel ? String(card.parallel).trim() : ''
   const playerName = card.player_name || ''
   const yearStr = card.year || ''
   const cardNumStr = card.card_number ? '#' + String(card.card_number).replace(/^#/, '') : ''
@@ -281,11 +282,20 @@ async function fetchTiersFromSCP(card) {
 let best = pool[0]
 const isParallelProduct = name => /\[[^\]]+\]/.test(String(name || ''))
 const brandLower = brandFull.toLowerCase()
+const parallelLower = parallelName.toLowerCase()
+// Prefer matching on the product's own set/console name when we know the specific insert or
+// parallel (e.g. "X Bob Ross") — many inserts are cataloged as their own separate SCP set rather
+// than a bracketed parallel of a base card, so this catches cases the bracket check below misses.
+const withMatchingConsole = parallelLower
+? pool.filter(p => String(p['console-name'] || '').toLowerCase().includes(parallelLower))
+: []
 const withMatchingParallel = pool.filter(p => {
 const m = String(p['product-name'] || '').match(/\[([^\]]+)\]/)
 return m && brandLower.includes(m[1].toLowerCase())
 })
-if (withMatchingParallel.length) {
+if (withMatchingConsole.length) {
+best = withMatchingConsole[0]
+} else if (withMatchingParallel.length) {
 best = withMatchingParallel[0]
 } else {
 const base = pool.filter(p => !isParallelProduct(p['product-name']))
@@ -294,7 +304,7 @@ if (base.length) best = base[0]
 if (cardNumStr) {
 const digits = cardNumStr.replace(/[^A-Za-z0-9]/g, '')
 const noParallelPool = pool.filter(p => !isParallelProduct(p['product-name']))
-const candidatePool = withMatchingParallel.length ? withMatchingParallel : (noParallelPool.length ? noParallelPool : pool)
+const candidatePool = withMatchingConsole.length ? withMatchingConsole : (withMatchingParallel.length ? withMatchingParallel : (noParallelPool.length ? noParallelPool : pool))
 // Require the card number as a standalone token (not adjacent to other alphanumerics) so a short
 // number like "#1" can't match by being a substring of an unrelated "#21", "/99" print run, etc.
 const numBoundaryRe = digits ? new RegExp(`(?<![A-Za-z0-9])${digits}(?![A-Za-z0-9])`, 'i') : null
