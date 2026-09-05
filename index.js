@@ -255,7 +255,14 @@ async function fetchTiersFromSCP(card) {
 
   // Try progressively broader queries so an unusual brand/parallel wording or a card-number
   // format mismatch doesn't zero out comps that genuinely exist on SportsCardsPro.
+  const brandOnly = card.brand ? String(card.brand).trim() : ''
+
+  // Try queries in the same word order the card actually reads (year, set/brand, player,
+  // parallel, number) before falling back to however our own form groups those fields. This
+  // lets SCP's own search relevance match the product as a whole instead of us assuming its
+  // product-name/console-name fields are laid out a particular way.
   const attemptParts = [
+    [yearStr, brandOnly, playerName, parallelName, cardNumStr],
     [yearStr, brandFull, playerName, cardNumStr],
     [yearStr, brandFull, playerName],
     [yearStr, playerName],
