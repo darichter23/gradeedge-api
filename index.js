@@ -781,7 +781,9 @@ async function resolveScpSet(consoleName) {
       const r = await fetch(`https://www.sportscardspro.com/console/${slug}`, { headers: { 'User-Agent': 'GradeEdgePro/1.0 (set checklist; Legendary subscriber)' } })
       if (!r.ok) continue
       const html = await r.text()
-      const uid = (html.match(/console-uids=([A-Za-z0-9]+)/) || [])[1]
+      // Logged-in pages carry the uid in the Download Price List link; anonymous pages (what the
+      // server sees) carry it in an inline VGPC.console_uid assignment — accept either.
+      const uid = (html.match(/console-uids=([A-Za-z0-9]+)/) || html.match(/VGPC\.console_uid\s*=\s*["']([A-Za-z0-9]+)["']/) || [])[1]
       if (!uid) continue
       const total = parseInt((html.match(/You own:\s*\d+\s*\/\s*([\d,]+)/) || ['', '0'])[1].replace(/,/g, ''), 10) || null
       const sportM = consoleName.match(/^([A-Za-z]+)\s+Cards/)
