@@ -801,8 +801,12 @@ async function loadSetCards(setRow) {
   const token = process.env.SPORTSCARDSPRO_API_TOKEN
   if (!token) throw new Error('SPORTSCARDSPRO_API_TOKEN not set')
   const url = `https://www.sportscardspro.com/price-guide/download-custom?t=${encodeURIComponent(token)}&console-uids=${encodeURIComponent(setRow.scp_uid)}`
-  const r = await fetch(url)
-  if (!r.ok) throw new Error(`SportsCardsPro CSV error: ${r.status}`)
+  const r = await fetch(url, { headers: { 'User-Agent': 'GradeEdgePro/1.0 (set checklist; Legendary subscriber; support@boisesummitcards.com)', 'Accept': 'text/csv,text/plain;q=0.9,*/*;q=0.8' } })
+  if (!r.ok) {
+    const snippet = (await r.text().catch(() => '')).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)
+    console.warn('[Sets] CSV fetch failed', r.status, setRow.scp_uid, snippet)
+    throw new Error(`SportsCardsPro CSV error: ${r.status}`)
+  }
   const rows = parseCsv(await r.text())
   const header = rows.shift() || []
   const col = name => header.indexOf(name)
