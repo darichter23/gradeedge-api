@@ -727,6 +727,140 @@ app.get('/api/players/search', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
+
+// ── Set Checklists (Buying Sector → "Set Checklist" mode) ───────────────────
+// Card lists come from the per-set price-list CSV that SportsCardsPro exposes to Legendary
+// subscribers (same token as the Prices API). One CSV = every product SCP catalogs for that
+// set, parallels included, so it doubles as a full checklist. A set is resolved to SCP's
+// internal console uid by fetching its public set page once (cached in scp_sets), then the
+// CSV is fetched and parsed and held in memory for 24h — nothing per-card is stored server-side.
+const SET_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const setCache = new Map() // scp_uid -> { at, meta, cards }
+
+function slugCandidatesForConsole(name) {
+  const base = String(name || '').trim().toLowerCase()
+  const a = base.replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  const b = base.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  return Array.from(new Set([a, b]))
+}
+
+function parseCsv(text) {
+  const rows = []
+  let row = [], field = '', inQ = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++ } else inQ = false }
+      else field += c
+    } else if (c === '"') inQ = true
+    else if (c === ',') { row.push(field); field = '' }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = '' }
+    else if (c !== '\r') field += c
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row) }
+  return rows
+}
+const csvMoney = v => { const n = parseFloat(String(v || '').replace(/[$,]/g, '')); return Number.isFinite(n) && n > 0 ? n : null }
+function parseSetProductName(productName) {
+  const name = String(productName || '')
+  const numM = name.match(/#(\S+)/)
+  const parM = name.match(/\[([^\]]+)\]/)
+  const player = name.replace(/#\S+/g, '').replace(/\[[^\]]*\]/g, '').replace(/\s{2,}/g, ' ').trim()
+  return { player, number: numM ? numM[1] : '', parallel: parM ? parM[1].trim() : '' }
+}
+const cardNumSortKey = n => { const m = String(n || '').match(/(\d+)/); return m ? parseInt(m[1], 10) : Number.MAX_SAFE_INTEGER }
+
+// Resolve a console-name (as returned by /api/products) to SCP's set uid, via the scp_sets
+// cache table first and the public set page second (the "Download Price List" link on the page
+// carries the uid). Returns null when the set can't be resolved.
+async function resolveScpSet(consoleName) {
+  const { data: cached } = await supabase.from('scp_sets').select('*').eq('console_name', consoleName).maybeSingle()
+  if (cached && cached.scp_uid) return cached
+  for (const slug of slugCandidatesForConsole(consoleName)) {
+    try {
+      const r = await fetch(`https://www.sportscardspro.com/console/${slug}`, { headers: { 'User-Agent': 'GradeEdgePro/1.0 (set checklist; Legendary subscriber)' } })
+      if (!r.ok) continue
+      const html = await r.text()
+      const uid = (html.match(/console-uids=([A-Za-z0-9]+)/) || [])[1]
+      if (!uid) continue
+      const total = parseInt((html.match(/You own:\s*\d+\s*\/\s*([\d,]+)/) || ['', '0'])[1].replace(/,/g, ''), 10) || null
+      const sportM = consoleName.match(/^([A-Za-z]+)\s+Cards/)
+      const row = { console_name: consoleName, slug, scp_uid: uid, sport: sportM ? sportM[1] : null, card_count: total, last_loaded_at: null }
+      await supabase.from('scp_sets').upsert(row, { onConflict: 'console_name' })
+      return row
+    } catch (e) { console.warn('[Sets] resolve failed', slug, e.message) }
+  }
+  return null
+}
+
+async function loadSetCards(setRow) {
+  const hit = setCache.get(setRow.scp_uid)
+  if (hit && Date.now() - hit.at < SET_CACHE_TTL_MS) return hit
+  const token = process.env.SPORTSCARDSPRO_API_TOKEN
+  if (!token) throw new Error('SPORTSCARDSPRO_API_TOKEN not set')
+  const url = `https://www.sportscardspro.com/price-guide/download-custom?t=${encodeURIComponent(token)}&console-uids=${encodeURIComponent(setRow.scp_uid)}`
+  const r = await fetch(url)
+  if (!r.ok) throw new Error(`SportsCardsPro CSV error: ${r.status}`)
+  const rows = parseCsv(await r.text())
+  const header = rows.shift() || []
+  const col = name => header.indexOf(name)
+  const iId = col('id'), iName = col('product-name'), iLoose = col('loose-price'), iPsa9 = col('graded-price'), iPsa10 = col('manual-only-price'), iVol = col('sales-volume'), iRel = col('release-date')
+  const cards = []
+  const parallelCounts = new Map()
+  let releaseDate = null
+  for (const row of rows) {
+    if (!row[iId]) continue
+    const p = parseSetProductName(row[iName])
+    if (p.parallel) parallelCounts.set(p.parallel, (parallelCounts.get(p.parallel) || 0) + 1)
+    if (!releaseDate && row[iRel]) releaseDate = row[iRel]
+    cards.push({ id: String(row[iId]), name: row[iName], player: p.player, number: p.number, parallel: p.parallel, raw: csvMoney(row[iLoose]), psa9: csvMoney(row[iPsa9]), psa10: csvMoney(row[iPsa10]), vol: parseInt(row[iVol], 10) || 0 })
+  }
+  cards.sort((a, b) => cardNumSortKey(a.number) - cardNumSortKey(b.number) || a.name.localeCompare(b.name))
+  const baseCount = cards.filter(c => !c.parallel).length
+  const parallels = Array.from(parallelCounts.entries()).map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+  const entry = { at: Date.now(), meta: { uid: setRow.scp_uid, console_name: setRow.console_name, sport: setRow.sport, total: cards.length, base_count: baseCount, release_date: releaseDate, parallels }, cards }
+  setCache.set(setRow.scp_uid, entry)
+  supabase.from('scp_sets').update({ card_count: cards.length, base_count: baseCount, last_loaded_at: new Date().toISOString() }).eq('console_name', setRow.console_name).then(() => {}, () => {})
+  return entry
+}
+
+// Set search: SCP's product search is the only catalog we have, so search it and dedupe the
+// console-names of what comes back; previously-loaded sets (scp_sets) are matched by name too.
+app.get('/api/sets/search', requireAuth, async (req, res) => {
+  try {
+    const q = (req.query.q || '').trim()
+    if (q.length < 3) return res.json({ sets: [] })
+    const seen = new Map()
+    const { data: known } = await supabase.from('scp_sets').select('console_name, sport, card_count, base_count').ilike('console_name', `%${q.replace(/[%_]/g, ' ')}%`).limit(10)
+    for (const s of known || []) seen.set(s.console_name, { console_name: s.console_name, sport: s.sport, card_count: s.card_count, base_count: s.base_count, known: true })
+    const search = await scpFetch('products', { q })
+    for (const p of (search.products || [])) {
+      const cn = p['console-name']
+      if (cn && !seen.has(cn)) seen.set(cn, { console_name: cn, sport: (cn.match(/^([A-Za-z]+)\s+Cards/) || [])[1] || null, known: false })
+    }
+    res.json({ sets: Array.from(seen.values()).slice(0, 15) })
+  } catch (err) { res.status(500).json({ error: err.message }) }
+})
+
+// Card list for one set. Default = base cards only (no bracketed parallel); ?parallel=<name>
+// returns that parallel's cards; ?all=1 returns everything (can be 30k+ rows — desktop only).
+app.get('/api/sets/cards', requireAuth, async (req, res) => {
+  try {
+    const consoleName = (req.query.console || '').trim()
+    if (!consoleName) return res.status(400).json({ error: 'console required' })
+    const setRow = await resolveScpSet(consoleName)
+    if (!setRow) return res.status(404).json({ error: 'Set not found on SportsCardsPro' })
+    const entry = await loadSetCards(setRow)
+    const parallel = (req.query.parallel || '').trim()
+    let cards = entry.cards
+    if (!req.query.all) cards = parallel ? cards.filter(c => c.parallel === parallel) : cards.filter(c => !c.parallel)
+    res.json({ set: entry.meta, cards })
+  } catch (err) {
+    console.error('[Sets] cards error:', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
 app.post('/api/watchlist/alerts', requireAuth, async (req, res) => {
   try {
     const { items } = req.body
