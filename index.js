@@ -922,6 +922,34 @@ app.post('/api/watchlist/alerts', requireAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
+// ── Shared card-identification guidance (used by /api/scan and /api/pregrade) ──────────────
+// The original one-line prompt never defined what each field meant or where on a card the info
+// lives, so Claude Vision reliably got the player (big text) but guessed year / brand / parallel /
+// card number (small print). This spells each field out and tells the model to return null rather
+// than a plausible-looking wrong value. `brand` deliberately means manufacturer + product line
+// ("Topps Chrome", "Panini Prizm") because that is what the app's Brand field and SCP queries use.
+const CARD_ID_GUIDE = `Identify this trading card as precisely as possible. Read every piece of printed text you can find before deciding — small print on the front (bottom edge, corners, along the border) and on the back (copyright line, card number, product name) is more reliable than the design alone.
+
+Field definitions — follow these exactly:
+- "player": the athlete's full name as printed. For multi-player cards, the first-listed player.
+- "year": the SET year as a 4-digit number. Use the year in the product name or copyright line (e.g. "2024 Topps", "© 2023 Panini"). If the copyright year and the product-name year differ, prefer the product name. If no year is printed anywhere, estimate from the design and set confidence to "low".
+- "brand": the manufacturer PLUS product line exactly as it appears on the card, without the year — e.g. "Topps Chrome", "Topps Series 1", "Bowman Chrome", "Panini Prizm", "Panini Select", "Panini Mosaic", "Donruss Optic", "Upper Deck Series 1". Never just "Topps" or "Panini" alone when the product line is visible.
+- "setName": the specific insert or subset name if this is NOT a base card (e.g. "1989 Topps Baseball", "All Aces", "Kaboom!", "Downtown", "Color Blast"). For a plain base card, repeat the brand value.
+- "parallel": the parallel/variation as printed or as visible from the card's finish — Refractor, X-Fractor, Sapphire, Silver Prizm, Gold, Blue Wave, Pink, Mojo, Holo, etc. Include the color when there is one ("Gold Refractor", "Red Prizm"). Serial-numbered cards are almost always a parallel — if you see "x/99"-style numbering, parallel must not be null. Use null ONLY when the card is clearly a plain base card with no special finish or color.
+- "cardNum": the card number as printed, without any "#" or "No." prefix. It is usually on the back near the copyright line, or in a corner of the front on Chrome/Prizm-style cards. Keep letter prefixes exactly ("BCP-12", "RC-5", "T89-3"). Never guess a card number — use null if you cannot actually read one.
+- "sport": one of Baseball, Basketball, Football, Hockey, Soccer, Other — infer from the team, league logo, or uniform.
+- "team": the team name as printed or shown on the uniform.
+- "rookie": true only if you can see an RC logo, "Rookie", "Rookie Card", or "1st Bowman" printed on the card.
+- "autograph": true only if there is a visible signature or "Autograph"/"Auto" wording on the card.
+- "serialNumber": the printed serial numbering in "x/y" form (e.g. "12/99"), otherwise null.
+- "grader" / "grade" / "certNum": fill only if the card is in a graded slab (PSA, BGS, SGC, CGC) and the label is readable — copy the grade and cert number exactly. Otherwise all three null.
+- "confidence": "high" only when year, brand, and cardNum were all actually read from printed text. "medium" when one of those was inferred. "low" when more than one was inferred or the photo is blurry/cropped.
+- "confidenceReason": one short sentence naming which fields were read vs. inferred, and whether a photo of the back would help.
+
+Do not pad fields with guesses to look complete — a null is far more useful to the collector than a plausible-looking wrong value.`
+
+const CARD_ID_JSON = '{"player":"name","year":2024,"brand":"manufacturer + product line","setName":"insert/subset name or brand","parallel":"parallel or null","cardNum":"card number or null","sport":"Baseball|Basketball|Football|Hockey|Soccer|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}'
+
 // ── AI Card Scanner ─────────────────────────────────────────────────────────
 app.post('/api/scan', requireAuth, aiLimiter, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
   try {
@@ -945,13 +973,16 @@ app.post('/api/scan', requireAuth, aiLimiter, upload.fields([{ name: 'image', ma
       { type: 'image', source: { type: 'base64', media_type: front.mediaType, data: front.base64 } }
     ]
     if (back) content.push({ type: 'image', source: { type: 'base64', media_type: back.mediaType, data: back.base64 } })
-    content.push({ type: 'text', text: back
-      ? 'You are a sports card expert. The first image is the FRONT of the card, the second image is the BACK. Use both to identify the card as accurately as possible — the back often has set/copyright info, and PSA/graded labels are on the slab holder which may be visible in either image. Return ONLY valid JSON with no markdown: {"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}'
-      : 'You are a sports card expert. Analyze this card image and return ONLY valid JSON with no markdown: {"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}'
+    content.push({ type: 'text', text:
+      (back
+        ? 'You are a sports card expert. The first image is the FRONT of the card, the second image is the BACK. Use both — the back usually carries the card number, product name, and copyright year, and graded-slab labels may be visible in either image.\n\n'
+        : 'You are a sports card expert. This is a photo of the FRONT of a card only (no back photo was provided), so read the front\'s fine print carefully and lower confidence for anything you could not actually read.\n\n')
+      + CARD_ID_GUIDE
+      + '\n\nReturn ONLY valid JSON with no markdown, in exactly this shape: ' + CARD_ID_JSON
     })
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-5', max_tokens: 500,
+      model: 'claude-sonnet-5', max_tokens: 700, temperature: 0,
       messages: [{ role: 'user', content }]
     })
     const responseText = message.content[0].text.trim()
@@ -1007,15 +1038,15 @@ app.post('/api/pregrade', requireAuth, aiLimiter, upload.fields([{ name: 'image'
 
 Give an honest, conservative assessment — this is used by a collector to decide whether a card is worth the cost of professional grading, so do not inflate the estimate. Note visible flaws precisely (e.g. "soft corner, bottom-left" rather than just "corners good"). If image quality, glare, or angle limits your ability to judge a specific aspect, say so in that aspect's assessment rather than guessing confidently. This is also sometimes used before the card is even purchased — e.g. from an eBay or CollX listing photo — to help decide whether it is worth buying in the first place; give a buy recommendation based purely on the card's assessed condition and grading potential, not price (you have no price data): "buy" if condition supports the estimated grade range well, "caution" for borderline flaws that could cap the grade, "pass" if condition issues make a low grade or non-gradable result likely.
 
-Also identify the card itself from these same photos — the back often has set/copyright info, and PSA/graded labels are on the slab holder which may be visible in either image. This saves the collector from having to scan the card a second time separately.
+Also identify the card itself from these same photos, so the collector does not have to scan it a second time. ${CARD_ID_GUIDE}
 
 Return ONLY valid JSON with no markdown, in exactly this shape:
-{"card":{"player":"name","year":2024,"brand":"manufacturer","setName":"set name","parallel":"parallel or null","cardNum":"card number","sport":"Baseball|Basketball|Football|Hockey|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"},"grader":"${grader}","centering":{"assessment":"1-2 sentence assessment","estimate":"e.g. 55/45 or null if not assessable"},"corners":{"assessment":"1-2 sentence assessment","condition":"sharp|slightly worn|worn"},"edges":{"assessment":"1-2 sentence assessment","condition":"clean|minor chipping|worn"},"surface":{"assessment":"1-2 sentence assessment","condition":"clean|minor flaws|notable flaws"},"estimatedGradeRange":"e.g. 8-9","gradable":true,"gradableReasoning":"1-2 sentences on why it is or isn't worth submitting for grading at this estimated range","buyRecommendation":{"verdict":"buy|caution|pass","reasoning":"2-3 sentences explaining the buy/caution/pass call based on condition and grading potential"},"limitations":"1-2 sentences noting this is a photo-based estimate only, not a substitute for in-hand professional grading, and what (if anything) limited this assessment"}`,
+{"card":${CARD_ID_JSON},"grader":"${grader}","centering":{"assessment":"1-2 sentence assessment","estimate":"e.g. 55/45 or null if not assessable"},"corners":{"assessment":"1-2 sentence assessment","condition":"sharp|slightly worn|worn"},"edges":{"assessment":"1-2 sentence assessment","condition":"clean|minor chipping|worn"},"surface":{"assessment":"1-2 sentence assessment","condition":"clean|minor flaws|notable flaws"},"estimatedGradeRange":"e.g. 8-9","gradable":true,"gradableReasoning":"1-2 sentences on why it is or isn't worth submitting for grading at this estimated range","buyRecommendation":{"verdict":"buy|caution|pass","reasoning":"2-3 sentences explaining the buy/caution/pass call based on condition and grading potential"},"limitations":"1-2 sentences noting this is a photo-based estimate only, not a substitute for in-hand professional grading, and what (if anything) limited this assessment"}`,
       },
     ]
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-5', max_tokens: 1500,
+      model: 'claude-sonnet-5', max_tokens: 1500, temperature: 0,
       messages: [{ role: 'user', content }]
     })
     const textBlock = (message.content || []).find(b => b.type === 'text')
