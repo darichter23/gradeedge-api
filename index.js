@@ -982,7 +982,7 @@ app.post('/api/scan', requireAuth, aiLimiter, upload.fields([{ name: 'image', ma
     })
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-5', max_tokens: 700, temperature: 0,
+      model: 'claude-sonnet-5', max_tokens: 700,
       messages: [{ role: 'user', content }]
     })
     const responseText = message.content[0].text.trim()
@@ -1046,7 +1046,7 @@ Return ONLY valid JSON with no markdown, in exactly this shape:
     ]
 
     const message = await anthropic.messages.create({
-      model: 'claude-sonnet-5', max_tokens: 1500, temperature: 0,
+      model: 'claude-sonnet-5', max_tokens: 1500,
       messages: [{ role: 'user', content }]
     })
     const textBlock = (message.content || []).find(b => b.type === 'text')
