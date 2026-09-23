@@ -336,6 +336,10 @@ await new Promise(r => setTimeout(r, 1100)) // respect SCP rate limit between th
             bgs10: centsToDollars(detail['bgs-10-price']),
             cgc10: centsToDollars(detail['condition-17-price']),
             sgc10: centsToDollars(detail['condition-18-price']),
+            // Extra SCP grade columns (PriceCharting API docs): 9.5 is any-grader, 19/20 are grader-specific 10s.
+            grade95: centsToDollars(detail['box-only-price']),
+            cgcPristine: centsToDollars(detail['condition-19-price']),
+            bgsBlack: centsToDollars(detail['condition-20-price']),
             salesVolume: detail['sales-volume'] ?? null,
           }
         }
@@ -650,6 +654,7 @@ app.post('/api/comps/tiers', requireAuth, async (req, res) => {
       matchedProduct: scp.matchedProduct,
       matchedSet: scp.matchedSet,
       psa8: scp.psa8, bgs10: scp.bgs10, cgc10: scp.cgc10, sgc10: scp.sgc10,
+      grade95: scp.grade95, cgcPristine: scp.cgcPristine, bgsBlack: scp.bgsBlack,
       source: 'SportsCardsPro',
       matched: true,
     })
@@ -1159,6 +1164,9 @@ app.get('/api/comps/multigrade', requireAuth, async (req, res) => {
                 bgs10: centsToDollars(detail['bgs-10-price']),
                 cgc10: centsToDollars(detail['condition-17-price']),
                 sgc10: centsToDollars(detail['condition-18-price']),
+                grade95: centsToDollars(detail['box-only-price']),
+                cgcPristine: centsToDollars(detail['condition-19-price']),
+                bgsBlack: centsToDollars(detail['condition-20-price']),
                 salesVolume: detail['sales-volume'] ?? null,
               })
             }
