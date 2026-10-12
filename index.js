@@ -955,6 +955,80 @@ Do not pad fields with guesses to look complete — a null is far more useful to
 
 const CARD_ID_JSON = '{"player":"name","year":2024,"brand":"manufacturer + product line","setName":"insert/subset name or brand","parallel":"parallel or null","cardNum":"card number or null","sport":"Baseball|Basketball|Football|Hockey|Soccer|Other","team":"team name","rookie":false,"autograph":false,"serialNumber":"x/y or null","grader":"PSA|BGS|SGC|CGC or null","grade":null,"certNum":null,"confidence":"high|medium|low","confidenceReason":"brief reason"}'
 
+// ── Catalog cross-check for scans ───────────────────────────────────────────
+// Claude Vision reads the big text (player, brand, parallel) reliably but the year and card number
+// live in tiny print, usually on the back, and front-only phone photos simply don't resolve them.
+// Rather than squinting harder, confirm the identification against the SportsCardsPro catalog:
+// SCP product names carry the card number ("Victor Wembanyama #221") and the set/console name
+// carries the year ("2025 Topps Chrome"). If exactly one catalog product fits what Vision read,
+// its year/number are the truth and overwrite Vision's guess (or fill its null).
+function scpSetYear(consoleName) {
+  const m = String(consoleName || '').match(/\b(19|20)\d{2}\b/)
+  return m ? parseInt(m[0], 10) : null
+}
+function scpProductNum(productName) {
+  const m = String(productName || '').match(/#([A-Za-z0-9-]+)/)
+  return m ? m[1] : null
+}
+async function catalogCrossCheck(card) {
+  const out = { applied: [], candidates: [], note: null }
+  try {
+    if (!card || !card.player || !process.env.SPORTSCARDSPRO_API_TOKEN) return out
+    const player = String(card.player).trim()
+    const lastName = player.split(/\s+/).pop().toLowerCase()
+    const brand = card.brand ? String(card.brand).trim() : ''
+    const parallel = card.parallel ? String(card.parallel).trim() : ''
+    const year = card.year ? String(card.year) : ''
+    const queries = [[year, brand, player].filter(Boolean).join(' '), [brand, player].filter(Boolean).join(' ')]
+    let products = []
+    for (const q of [...new Set(queries)]) {
+      if (!q) continue
+      const search = await scpFetch('products', { q })
+      if (search.status === 'success' && search.products?.length) { products = search.products; out.query = q; break }
+      await new Promise(r => setTimeout(r, 1100))
+    }
+    if (!products.length) return out
+
+    // Keep only this player's cards; prefer products whose set name contains the brand words.
+    const brandWords = brand.toLowerCase().split(/\s+/).filter(w => w.length > 2)
+    let pool = products.filter(p => String(p['product-name'] || '').toLowerCase().includes(lastName))
+    const brandPool = pool.filter(p => { const c = String(p['console-name'] || '').toLowerCase(); return brandWords.every(w => c.includes(w)) })
+    if (brandPool.length) pool = brandPool
+    if (year) { const yp = pool.filter(p => scpSetYear(p['console-name']) === parseInt(year, 10)); if (yp.length) pool = yp }
+    if (!pool.length) return out
+
+    // Parallels are bracketed on SCP ("[Blue X-Fractor]") — match them if Vision saw one.
+    const parLower = parallel.toLowerCase()
+    const parPool = parLower ? pool.filter(p => String(p['product-name'] || '').toLowerCase().includes(`[${parLower}]`)) : []
+    const basePool = pool.filter(p => !/\[[^\]]+\]/.test(String(p['product-name'] || '')))
+    const chosen = parPool.length ? parPool : (basePool.length ? basePool : pool)
+
+    const nums = [...new Set(chosen.map(p => scpProductNum(p['product-name'])).filter(Boolean))]
+    const years = [...new Set(chosen.map(p => scpSetYear(p['console-name'])).filter(Boolean))]
+    out.candidates = chosen.slice(0, 6).map(p => ({ id: p.id, product: p['product-name'], set: p['console-name'] }))
+
+    // Year: catalog wins whenever the matched set has a single year.
+    if (years.length === 1 && years[0] !== card.year) { card.year = years[0]; out.applied.push('year') }
+    // Card number: fill a null, or correct a read that matches no catalog product for this set.
+    const visionNum = card.cardNum ? String(card.cardNum).replace(/^#/, '') : null
+    if (nums.length === 1) {
+      if (!visionNum || visionNum.toLowerCase() !== nums[0].toLowerCase()) { card.cardNum = nums[0]; out.applied.push('cardNum') }
+    } else if (nums.length > 1 && visionNum) {
+      const hit = nums.find(n => n.toLowerCase() === visionNum.toLowerCase())
+      if (!hit) { out.note = `Card # ${visionNum} not found in ${chosen[0]['console-name']} — catalog has ${nums.slice(0, 6).join(', ')}` }
+    } else if (nums.length > 1 && !visionNum) {
+      out.note = `Several ${player} cards in ${chosen[0]['console-name']} (#${nums.slice(0, 6).join(', #')}) — pick the number from the back of the card`
+    }
+    if (out.applied.length) {
+      card.confidence = card.confidence === 'low' ? 'medium' : card.confidence
+      card.confidenceReason = `${card.confidenceReason || ''} Catalog-confirmed ${out.applied.join(' + ')} against SportsCardsPro (${chosen[0]['console-name']}).`.trim()
+    }
+  } catch (e) {
+    console.error('[Scan] catalog cross-check failed:', e.message)
+  }
+  return out
+}
+
 // ── AI Card Scanner ─────────────────────────────────────────────────────────
 app.post('/api/scan', requireAuth, aiLimiter, upload.fields([{ name: 'image', maxCount: 1 }, { name: 'imageBack', maxCount: 1 }]), async (req, res) => {
   try {
@@ -994,7 +1068,8 @@ app.post('/api/scan', requireAuth, aiLimiter, upload.fields([{ name: 'image', ma
     let cardData
     try { const m = responseText.match(/\{[\s\S]*\}/); cardData = JSON.parse(m ? m[0] : responseText) }
     catch (e) { return res.status(500).json({ error: 'Could not parse card data', raw: responseText }) }
-    res.json({ success: true, card: cardData, scannedAt: new Date().toISOString() })
+    const catalog = await catalogCrossCheck(cardData)
+    res.json({ success: true, card: cardData, catalog, scannedAt: new Date().toISOString() })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -1063,7 +1138,8 @@ Return ONLY valid JSON with no markdown, in exactly this shape:
     try { const m = responseText.match(/\{[\s\S]*\}/); pregradeData = JSON.parse(m ? m[0] : responseText) }
     catch (e) { return res.status(500).json({ error: 'Could not parse pre-grade data', raw: responseText }) }
     const { card: cardData, ...pregradeOnly } = pregradeData || {}
-    res.json({ success: true, card: cardData || null, pregrade: pregradeOnly, assessedAt: new Date().toISOString() })
+    const catalog = cardData ? await catalogCrossCheck(cardData) : null
+    res.json({ success: true, card: cardData || null, catalog, pregrade: pregradeOnly, assessedAt: new Date().toISOString() })
   } catch (err) {
     console.error('[Pregrade] error:', err.message)
     res.status(500).json({ error: err.message })
